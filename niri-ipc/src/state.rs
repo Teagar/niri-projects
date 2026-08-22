@@ -9,7 +9,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-use crate::{Cast, Event, KeyboardLayouts, Window, Workspace};
+use crate::{Cast, Event, KeyboardLayouts, Project, ProjectState, Window, Workspace};
 
 /// Part of the state communicated via the event stream.
 pub trait EventStreamStatePart {
@@ -43,6 +43,9 @@ pub struct EventStreamState {
 
     /// State of the overview.
     pub overview: OverviewState,
+
+    /// State of projects.
+    pub projects: ProjectsState,
 
     /// State of the config.
     pub config: ConfigState,
@@ -79,6 +82,13 @@ pub struct OverviewState {
     pub is_open: bool,
 }
 
+/// The projects state communicated over the event stream.
+#[derive(Debug, Default)]
+pub struct ProjectsState {
+    /// List of all configured projects.
+    pub projects: Vec<Project>,
+}
+
 /// The config state communicated over the event stream.
 #[derive(Debug, Default)]
 pub struct ConfigState {
@@ -100,6 +110,7 @@ impl EventStreamStatePart for EventStreamState {
         events.extend(self.windows.replicate());
         events.extend(self.keyboard_layouts.replicate());
         events.extend(self.overview.replicate());
+        events.extend(self.projects.replicate());
         events.extend(self.config.replicate());
         events.extend(self.casts.replicate());
         events
@@ -110,6 +121,7 @@ impl EventStreamStatePart for EventStreamState {
         let event = self.windows.apply(event)?;
         let event = self.keyboard_layouts.apply(event)?;
         let event = self.overview.apply(event)?;
+        let event = self.projects.apply(event)?;
         let event = self.config.apply(event)?;
         let event = self.casts.apply(event)?;
         Some(event)
@@ -273,6 +285,38 @@ impl EventStreamStatePart for OverviewState {
         match event {
             Event::OverviewOpenedOrClosed { is_open } => {
                 self.is_open = is_open;
+            }
+            event => return Some(event),
+        }
+        None
+    }
+}
+
+impl EventStreamStatePart for ProjectsState {
+    fn replicate(&self) -> Vec<Event> {
+        vec![Event::ProjectsChanged {
+            projects: self.projects.clone(),
+        }]
+    }
+
+    fn apply(&mut self, event: Event) -> Option<Event> {
+        match event {
+            Event::ProjectsChanged { projects } => {
+                self.projects = projects;
+            }
+            Event::ProjectActivated { project_name } => {
+                for project in &mut self.projects {
+                    if project.name == project_name {
+                        project.state = ProjectState::Active;
+                    }
+                }
+            }
+            Event::ProjectClosed { project_name } => {
+                for project in &mut self.projects {
+                    if project.name == project_name {
+                        project.state = ProjectState::Dormant;
+                    }
+                }
             }
             event => return Some(event),
         }

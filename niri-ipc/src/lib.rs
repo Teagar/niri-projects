@@ -117,6 +117,8 @@ pub enum Request {
     ReturnError,
     /// Request information about the overview.
     OverviewState,
+    /// Request information about projects.
+    Projects,
     /// Request information about screencasts.
     Casts,
 }
@@ -163,6 +165,8 @@ pub enum Response {
     OutputConfigChanged(OutputConfigChanged),
     /// Information about the overview.
     OverviewState(Overview),
+    /// Information about projects.
+    Projects(Vec<Project>),
     /// Information about screencasts.
     Casts(Vec<Cast>),
 }
@@ -173,6 +177,30 @@ pub enum Response {
 pub struct Overview {
     /// Whether the overview is currently open.
     pub is_open: bool,
+}
+
+/// A project.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct Project {
+    /// Name of this project.
+    pub name: String,
+    /// Current state of this project.
+    pub state: ProjectState,
+    /// Whether this project stays warm when switching away from it.
+    pub keep_open: bool,
+}
+
+/// State of a project.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ProjectState {
+    /// The project has no running workspaces or processes.
+    Dormant,
+    /// The project's workspaces are parked off-screen with their windows alive.
+    Warm,
+    /// The project is currently active and visible.
+    Active,
 }
 
 /// Color picked from the screen.
@@ -914,6 +942,44 @@ pub enum Action {
     OpenOverview {},
     /// Close the Overview.
     CloseOverview {},
+    /// Switch to a project, making it active.
+    SwitchProject {
+        /// Name of the project to switch to.
+        #[cfg_attr(feature = "clap", arg(long))]
+        project: String,
+    },
+    /// Close a project, returning it to dormant and killing its processes.
+    ///
+    /// Fails if the project is configured with keep-open; use
+    /// [`Action::CloseProjectForce`] for that (or remove the setting).
+    CloseProject {
+        /// Name of the project to close.
+        #[cfg_attr(feature = "clap", arg(long))]
+        project: String,
+    },
+    /// Force-close a project even if it is configured with keep-open.
+    CloseProjectForce {
+        /// Name of the project to close.
+        #[cfg_attr(feature = "clap", arg(long))]
+        project: String,
+    },
+    /// Pre-warm a project: run its startup commands and park its workspaces
+    /// off-screen without activating it.
+    KeepProjectOpen {
+        /// Name of the project to pre-warm.
+        #[cfg_attr(feature = "clap", arg(long))]
+        project: String,
+    },
+    /// Toggle (open/close) the project overview with staggered-depth rendering.
+    ToggleProjectOverview {},
+    /// Move focus to the previous project slot in the project overview.
+    ProjectOverviewFocusSlotPrev {},
+    /// Move focus to the next project slot in the project overview.
+    ProjectOverviewFocusSlotNext {},
+    /// Move focus one depth layer closer in the project overview.
+    ProjectOverviewFocusDepthCloser {},
+    /// Move focus one depth layer further away in the project overview.
+    ProjectOverviewFocusDepthFurther {},
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.
@@ -1702,6 +1768,24 @@ pub enum Event {
     OverviewOpenedOrClosed {
         /// The new state of the overview.
         is_open: bool,
+    },
+    /// The projects have changed.
+    ///
+    /// This configuration completely replaces the previous configuration. I.e. if any projects
+    /// are missing from here, then they were closed or removed.
+    ProjectsChanged {
+        /// The new project information.
+        projects: Vec<Project>,
+    },
+    /// A project became the active one.
+    ProjectActivated {
+        /// Name of the activated project.
+        project_name: String,
+    },
+    /// A project was closed, returning to dormant.
+    ProjectClosed {
+        /// Name of the closed project.
+        project_name: String,
     },
     /// The configuration was reloaded.
     ///
