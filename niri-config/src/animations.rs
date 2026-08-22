@@ -9,6 +9,7 @@ pub struct Animations {
     pub off: bool,
     pub slowdown: f64,
     pub workspace_switch: WorkspaceSwitchAnim,
+    pub project_switch: ProjectSwitchAnim,
     pub window_open: WindowOpenAnim,
     pub window_close: WindowCloseAnim,
     pub horizontal_view_movement: HorizontalViewMovementAnim,
@@ -27,6 +28,7 @@ impl Default for Animations {
             off: false,
             slowdown: 1.,
             workspace_switch: Default::default(),
+            project_switch: Default::default(),
             horizontal_view_movement: Default::default(),
             window_movement: Default::default(),
             window_open: Default::default(),
@@ -51,6 +53,8 @@ pub struct AnimationsPart {
     pub slowdown: Option<FloatOrInt<0, { i32::MAX }>>,
     #[knuffel(child)]
     pub workspace_switch: Option<WorkspaceSwitchAnim>,
+    #[knuffel(child)]
+    pub project_switch: Option<ProjectSwitchAnim>,
     #[knuffel(child)]
     pub window_open: Option<WindowOpenAnim>,
     #[knuffel(child)]
@@ -87,6 +91,7 @@ impl MergeWith<AnimationsPart> for Animations {
         merge_clone!(
             (self, part),
             workspace_switch,
+            project_switch,
             window_open,
             window_close,
             horizontal_view_movement,
@@ -145,6 +150,22 @@ impl Default for WorkspaceSwitchAnim {
             kind: Kind::Spring(SpringParams {
                 damping_ratio: 1.,
                 stiffness: 1000,
+                epsilon: 0.0001,
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProjectSwitchAnim(pub Animation);
+
+impl Default for ProjectSwitchAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Spring(SpringParams {
+                damping_ratio: 1.,
+                stiffness: 800,
                 epsilon: 0.0001,
             }),
         })
@@ -327,6 +348,21 @@ impl Default for RecentWindowsCloseAnim {
 }
 
 impl<S> knuffel::Decode<S> for WorkspaceSwitchAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for ProjectSwitchAnim
 where
     S: knuffel::traits::ErrorSpan,
 {

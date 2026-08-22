@@ -39,6 +39,7 @@ pub mod layer_rule;
 pub mod layout;
 pub mod misc;
 pub mod output;
+pub mod project;
 pub mod recent_windows;
 pub mod utils;
 pub mod window_rule;
@@ -55,6 +56,8 @@ pub use crate::layer_rule::LayerRule;
 pub use crate::layout::*;
 pub use crate::misc::*;
 pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
+use crate::project::ProjectsConfig;
+pub use crate::project::{ProjectConfig, ProjectWorkspaceConfig};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
 pub use crate::utils::FloatOrInt;
@@ -91,6 +94,7 @@ pub struct Config {
     pub switch_events: SwitchBinds,
     pub debug: Debug,
     pub workspaces: Vec<Workspace>,
+    pub projects: Vec<ProjectConfig>,
     pub recent_windows: RecentWindows,
 }
 
@@ -216,6 +220,11 @@ where
                 "workspace" => m_push!(workspaces),
 
                 // Single-part sections.
+                "projects" => {
+                    let part = ProjectsConfig::decode_node(node, ctx)?;
+                    config.borrow_mut().projects = part.0;
+                }
+
                 "binds" => {
                     let part = Binds::decode_node(node, ctx)?;
 
@@ -1546,6 +1555,18 @@ mod tests {
                         ),
                     },
                 ),
+                project_switch: ProjectSwitchAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 800,
+                                epsilon: 0.0001,
+                            },
+                        ),
+                    },
+                ),
                 window_open: WindowOpenAnim {
                     anim: Animation {
                         off: true,
@@ -2326,6 +2347,7 @@ mod tests {
                     layout: None,
                 },
             ],
+            projects: [],
             recent_windows: RecentWindows {
                 on: false,
                 debounce_ms: 750,
