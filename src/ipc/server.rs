@@ -811,6 +811,45 @@ impl State {
         server.send_event(event);
     }
 
+    pub fn ipc_refresh_projects(&mut self) {
+        use niri_ipc::ProjectState;
+
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        let _span = tracy_client::span!("State::ipc_refresh_projects");
+
+        let new_projects = self.niri.layout.ipc_projects();
+
+        let mut state = server.event_stream_state.borrow_mut();
+        let old_projects = std::mem::take(&mut state.projects.projects);
+
+        // Emit convenience transition events.
+        for new in &new_projects {
+            if let Some(old) = old_projects.iter().find(|p| p.name == new.name) {
+                if old.state != ProjectState::Active && new.state == ProjectState::Active {
+                    server.send_event(Event::ProjectActivated {
+                        project_name: new.name.clone(),
+                    });
+                } else if old.state != ProjectState::Dormant && new.state == ProjectState::Dormant {
+                    server.send_event(Event::ProjectClosed {
+                        project_name: new.name.clone(),
+                    });
+                }
+            }
+        }
+
+        if old_projects != new_projects {
+            let event = Event::ProjectsChanged {
+                projects: new_projects.clone(),
+            };
+            server.send_event(event);
+        }
+
+        state.projects.projects = new_projects;
+    }
+
     pub fn ipc_refresh_casts(&mut self) {
         let Some(server) = &self.niri.ipc_server else {
             return;

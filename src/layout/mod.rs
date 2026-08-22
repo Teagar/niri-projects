@@ -726,7 +726,15 @@ impl RenderLayer {
 
 impl<W: LayoutElement> Layout<W> {
     pub fn new(clock: Clock, config: &Config) -> Self {
-        Self::with_options_and_workspaces(clock, config, Options::from_config(config))
+        let mut layout =
+            Self::with_options_and_workspaces(clock, config, Options::from_config(config));
+
+        // Seed the runtime project state from the initial config.
+        for project in &config.projects {
+            layout.ensure_project(project);
+        }
+
+        layout
     }
 
     pub fn with_options(clock: Clock, options: Options) -> Self {
@@ -5061,6 +5069,26 @@ impl<W: LayoutElement> Layout<W> {
 
     // ── Project management ──────────────────────────────────────────────
 
+    /// Current project state for IPC reporting.
+    pub fn ipc_projects(&self) -> Vec<niri_ipc::Project> {
+        use niri_ipc::ProjectState;
+
+        self.projects
+            .iter()
+            .map(|p| niri_ipc::Project {
+                name: p.name().to_owned(),
+                state: if self.active_project_name.as_deref() == Some(p.name()) {
+                    ProjectState::Active
+                } else if p.is_warm() {
+                    ProjectState::Warm
+                } else {
+                    ProjectState::Dormant
+                },
+                keep_open: p.keep_open(),
+            })
+            .collect()
+    }
+
     pub fn active_project_name(&self) -> Option<&str> {
         self.active_project_name.as_deref()
     }
@@ -5094,7 +5122,9 @@ impl<W: LayoutElement> Layout<W> {
         // If it's the active project, close it first (park + destroy).
         if self.active_project_name.as_deref() == Some(name) {
             self.park_active_project_then_destroy();
+            self.active_project_name = None;
         }
+
         self.projects.swap_remove(idx);
     }
 

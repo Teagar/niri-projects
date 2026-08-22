@@ -1465,6 +1465,17 @@ impl State {
             self.niri.layout.unname_workspace(&name);
         }
 
+        // Find & close removed projects.
+        let mut removed_projects: Vec<String> = vec![];
+        for project in &self.niri.config.borrow().projects {
+            if !config.projects.iter().any(|p| p.name == project.name) {
+                removed_projects.push(project.name.clone());
+            }
+        }
+        for name in removed_projects {
+            self.niri.layout.unproject(&name);
+        }
+
         self.niri.layout.update_config(&config);
         for mapped in self.niri.mapped_layer_surfaces.values_mut() {
             mapped.update_config(&config);
@@ -1474,6 +1485,12 @@ impl State {
         for ws_config in &config.workspaces {
             self.niri.layout.ensure_named_workspace(ws_config);
         }
+
+        // Create new projects (and refresh config snapshots of existing ones).
+        for project_config in &config.projects {
+            self.niri.layout.ensure_project(project_config);
+        }
+        self.ipc_refresh_projects();
 
         let rate = 1.0 / config.animations.slowdown.max(0.001);
         self.niri.clock.set_rate(rate);

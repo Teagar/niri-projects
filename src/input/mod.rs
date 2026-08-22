@@ -2311,11 +2311,13 @@ impl State {
                     for cmd in &result.startup_commands {
                         crate::utils::spawning::spawn(cmd.clone(), None);
                     }
+                    self.ipc_refresh_projects();
                     self.niri.queue_redraw_all();
                 }
             }
             Action::CloseProject(name) | Action::CloseProjectForce(name) => {
                 if self.niri.layout.close_project(&name) {
+                    self.ipc_refresh_projects();
                     self.niri.queue_redraw_all();
                 }
             }
