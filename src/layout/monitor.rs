@@ -693,6 +693,46 @@ impl<W: LayoutElement> Monitor<W> {
         true
     }
 
+    /// Removes the workspaces with the given ids from this monitor, returning
+    /// them in their original order.
+    ///
+    /// Used for parking project workspaces when switching projects. Adjusts
+    /// the active workspace index and cancels any in-flight workspace switch.
+    pub(super) fn take_workspaces_by_id(&mut self, ids: &[WorkspaceId]) -> Vec<Workspace<W>> {
+        let mut removed = Vec::new();
+
+        // Remove from highest index first so earlier indices stay stable.
+        let mut i = self.workspaces.len();
+        while i > 0 {
+            i -= 1;
+            if ids.contains(&self.workspaces[i].id()) {
+                let mut ws = self.workspaces.remove(i);
+                ws.set_output(None);
+                removed.push(ws);
+
+                if i <= self.active_workspace_idx && self.active_workspace_idx > 0 {
+                    self.active_workspace_idx -= 1;
+                }
+            }
+        }
+
+        if !removed.is_empty() {
+            // The view may have been animating towards a workspace we just
+            // parked; reset the animation rather than trying to correct it.
+            self.workspace_switch = None;
+
+            if self
+                .previous_workspace_id
+                .is_some_and(|prev| ids.contains(&prev))
+            {
+                self.previous_workspace_id = None;
+            }
+        }
+
+        removed.reverse();
+        removed
+    }
+
     pub fn remove_workspace_by_idx(&mut self, mut idx: usize) -> Workspace<W> {
         if idx == self.workspaces.len() - 1 {
             self.add_workspace_bottom();

@@ -480,6 +480,15 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                     Event::OverviewOpenedOrClosed { is_open: opened } => {
                         println!("Overview toggled: {opened}");
                     }
+                    Event::ProjectsChanged { projects } => {
+                        println!("Projects changed: {projects:?}");
+                    }
+                    Event::ProjectActivated { project_name } => {
+                        println!("Project activated: {project_name}");
+                    }
+                    Event::ProjectClosed { project_name } => {
+                        println!("Project closed: {project_name}");
+                    }
                     Event::ConfigLoaded { failed } => {
                         let status = if failed {
                             "with an error"

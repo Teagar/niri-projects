@@ -367,6 +367,8 @@ pub enum Action {
     CloseOverview,
     SwitchProject(#[knuffel(argument)] String),
     CloseProject(#[knuffel(argument)] String),
+    #[knuffel(skip)]
+    CloseProjectForce(String),
     KeepProjectOpen(#[knuffel(argument)] String),
     ToggleProjectOverview,
     ProjectOverviewFocusSlotPrev,

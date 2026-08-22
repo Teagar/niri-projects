@@ -2305,6 +2305,44 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::SwitchProject(name) => {
+                if let Some(result) = self.niri.layout.switch_to_project(&name) {
+                    // Spawn startup commands for a dormant project.
+                    for cmd in &result.startup_commands {
+                        crate::utils::spawning::spawn(cmd.clone(), None);
+                    }
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::CloseProject(name) | Action::CloseProjectForce(name) => {
+                if self.niri.layout.close_project(&name) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::KeepProjectOpen(_name) => {
+                // Pre-warming is a no-op in the first pass (only switch activates).
+                // TODO: pre-warm project workspaces without activating.
+            }
+            Action::ToggleProjectOverview => {
+                self.niri.layout.toggle_project_overview();
+                self.niri.queue_redraw_all();
+            }
+            Action::ProjectOverviewFocusSlotPrev => {
+                self.niri.layout.project_overview_focus_slot_prev();
+                self.niri.queue_redraw_all();
+            }
+            Action::ProjectOverviewFocusSlotNext => {
+                self.niri.layout.project_overview_focus_slot_next();
+                self.niri.queue_redraw_all();
+            }
+            Action::ProjectOverviewFocusDepthCloser => {
+                self.niri.layout.project_overview_focus_depth_closer();
+                self.niri.queue_redraw_all();
+            }
+            Action::ProjectOverviewFocusDepthFurther => {
+                self.niri.layout.project_overview_focus_depth_further();
+                self.niri.queue_redraw_all();
+            }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
                     .niri

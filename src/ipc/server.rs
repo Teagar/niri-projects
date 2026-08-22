@@ -282,6 +282,11 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let workspaces = state.workspaces.workspaces.values().cloned().collect();
             Response::Workspaces(workspaces)
         }
+        Request::Projects => {
+            let state = ctx.event_stream_state.borrow();
+            let projects = state.projects.projects.clone();
+            Response::Projects(projects)
+        }
         Request::Windows => {
             let state = ctx.event_stream_state.borrow();
             let windows = state.windows.windows.values().cloned().collect();

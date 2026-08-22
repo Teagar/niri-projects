@@ -81,6 +81,7 @@ pub mod focus_ring;
 pub mod insert_hint_element;
 pub mod monitor;
 pub mod opening_window;
+pub mod project;
 pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
@@ -373,6 +374,13 @@ pub struct Layout<W: LayoutElement> {
     overview_progress: Option<OverviewProgress>,
     /// Configurable properties of the layout.
     options: Rc<Options>,
+    /// All configured projects, in config order.
+    projects: Vec<project::Project<W>>,
+    /// Name of the currently active project, if any.
+    /// `None` means the implicit default desktop (no project boundaries).
+    active_project_name: Option<String>,
+    /// Monotonically increasing color index for the next newly-created project.
+    next_project_color_index: usize,
 }
 
 #[derive(Debug)]
@@ -729,6 +737,9 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: Rc::new(options),
+            projects: Vec::new(),
+            active_project_name: None,
+            next_project_color_index: 0,
         }
     }
 
@@ -754,6 +765,9 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             options: opts,
+            projects: Vec::new(),
+            active_project_name: None,
+            next_project_color_index: 0,
         }
     }
 
@@ -1407,6 +1421,13 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        // Also search warm project workspaces (parked off-screen).
+        if let Some((window, _)) =
+            Self::find_wl_surface_in_warm_projects(&self.projects, wl_surface)
+        {
+            return Some((window, None));
+        }
+
         None
     }
 
@@ -1437,6 +1458,13 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
             }
+        }
+
+        // Also search warm project workspaces (parked off-screen).
+        if let Some((window, _)) =
+            Self::find_wl_surface_in_warm_projects_mut(&mut self.projects, wl_surface)
+        {
+            return Some((window, None));
         }
 
         None
@@ -5009,6 +5037,268 @@ impl<W: LayoutElement> Layout<W> {
     pub fn is_overview_open(&self) -> bool {
         self.overview_open
     }
+
+    // ── Project management ──────────────────────────────────────────────
+
+    pub fn active_project_name(&self) -> Option<&str> {
+        self.active_project_name.as_deref()
+    }
+
+    /// Index into `self.projects` by name.
+    fn project_index(&self, name: &str) -> Option<usize> {
+        self.projects.iter().position(|p| p.name() == name)
+    }
+
+    /// Ensure a project exists (creating it as dormant if new) with the given
+    /// config.  If it already exists, the config snapshot is updated in-place
+    /// (runtime state like Warm workspaces is preserved).
+    pub fn ensure_project(&mut self, config: &niri_config::ProjectConfig) {
+        if let Some(idx) = self.project_index(&config.name) {
+            // Update the config snapshot; keep runtime state.
+            self.projects[idx].config = config.clone();
+        } else {
+            let color_index = self.next_project_color_index;
+            self.next_project_color_index += 1;
+            self.projects
+                .push(project::Project::new(config.clone(), color_index));
+        }
+    }
+
+    /// Remove a project from the list, closing it first if necessary.
+    pub fn unproject(&mut self, name: &str) {
+        let Some(idx) = self.project_index(name) else {
+            return;
+        };
+
+        // If it's the active project, close it first (park + destroy).
+        if self.active_project_name.as_deref() == Some(name) {
+            self.park_active_project_then_destroy();
+        }
+        self.projects.swap_remove(idx);
+    }
+
+    /// Park the active project's workspaces off the visible monitors, moving
+    /// them from attached to warm.  If there is no active project, this is a
+    /// no-op.
+    fn park_active_project(&mut self) {
+        let name = match &self.active_project_name {
+            Some(name) => name.clone(),
+            None => return,
+        };
+
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            return;
+        };
+
+        let mon = &mut monitors[*active_monitor_idx];
+
+        let project_ws_ids: Vec<WorkspaceId> = mon
+            .workspaces
+            .iter()
+            .filter(|ws| ws.has_windows_or_name())
+            .map(|ws| ws.id())
+            .collect();
+
+        let parked = mon.take_workspaces_by_id(&project_ws_ids);
+        let active_idx = mon.active_workspace_idx;
+
+        if !parked.is_empty() {
+            if let Some(idx) = self.project_index(&name) {
+                self.projects[idx].park_workspaces(parked, active_idx);
+            }
+        }
+    }
+
+    /// Park the active project then destroy its workspaces (for closing).
+    fn park_active_project_then_destroy(&mut self) {
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            return;
+        };
+
+        let mon = &mut monitors[*active_monitor_idx];
+
+        let project_ws_ids: Vec<WorkspaceId> = mon
+            .workspaces
+            .iter()
+            .filter(|ws| ws.has_windows_or_name())
+            .map(|ws| ws.id())
+            .collect();
+
+        // Just remove; don't store them (dropping = destroying).
+        mon.take_workspaces_by_id(&project_ws_ids);
+    }
+
+    /// Switch to the named project.  Returns the startup commands if the
+    /// project was dormant (needs spawning).
+    pub fn switch_to_project(&mut self, name: &str) -> Option<project::ProjectSwitchResult> {
+        let idx = self.project_index(name)?;
+
+        // Already active — nothing to do.
+        if self.active_project_name.as_deref() == Some(name) {
+            return None;
+        }
+
+        // Park the current project (if any).
+        self.park_active_project();
+
+        // Take workspaces from the target project.
+        let (parked_ws, _parked_idx) = self.projects[idx].take_workspaces();
+        let was_warm = !parked_ws.is_empty();
+        let project_name = self.projects[idx].name().to_string();
+
+        // Build startup commands from config (for dormant projects).
+        let mut startup_commands = Vec::new();
+        if !was_warm {
+            for ws_cfg in &self.projects[idx].config.workspaces {
+                for spawn in &ws_cfg.spawn_at_startup {
+                    if !spawn.command.is_empty() {
+                        startup_commands.push(spawn.command.clone());
+                    }
+                }
+            }
+        }
+
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            return None;
+        };
+
+        let mon = &mut monitors[*active_monitor_idx];
+        let output = mon.output.clone();
+
+        if was_warm {
+            // Re-attach parked workspaces.
+            let count = parked_ws.len();
+            for (i, mut ws) in parked_ws.into_iter().enumerate() {
+                ws.set_output(Some(output.clone()));
+                ws.update_config(mon.options.clone());
+                // Insert in reverse so they end up in original order.
+                let insert_idx = count - 1 - i;
+                mon.insert_workspace(ws, insert_idx, insert_idx == 0);
+            }
+        } else {
+            // Create workspaces from config for dormant projects.
+            let clock = self.clock.clone();
+            let options = mon.options.clone();
+            for (i, ws_cfg) in self.projects[idx].config.workspaces.iter().enumerate() {
+                let ws_config = niri_config::Workspace {
+                    name: niri_config::workspace::WorkspaceName(ws_cfg.name.clone()),
+                    open_on_output: None,
+                    layout: None,
+                };
+                let ws = Workspace::new_with_config(
+                    output.clone(),
+                    Some(ws_config),
+                    clock.clone(),
+                    options.clone(),
+                );
+                mon.insert_workspace(ws, i, i == 0);
+            }
+        }
+
+        self.active_project_name = Some(project_name.clone());
+
+        Some(project::ProjectSwitchResult {
+            activated_name: project_name,
+            startup_commands,
+            was_warm,
+        })
+    }
+
+    /// Close a project, destroying its warm workspaces.
+    pub fn close_project(&mut self, name: &str) -> bool {
+        let idx = match self.project_index(name) {
+            Some(idx) => idx,
+            None => return false,
+        };
+
+        // If it's active, park and destroy.
+        if self.active_project_name.as_deref() == Some(name) {
+            self.park_active_project_then_destroy();
+            self.active_project_name = None;
+        } else {
+            // Just destroy warm workspaces.
+            self.projects[idx].take_workspaces();
+        }
+
+        true
+    }
+
+    // ── Project overview stubs ──────────────────────────────────────────
+
+    pub fn toggle_project_overview(&mut self) {
+        self.toggle_overview();
+    }
+
+    pub fn project_overview_focus_slot_prev(&mut self) {
+        // TODO: cycle focus between project slots in overview.
+    }
+
+    pub fn project_overview_focus_slot_next(&mut self) {
+        // TODO: cycle focus between project slots in overview.
+    }
+
+    pub fn project_overview_focus_depth_closer(&mut self) {
+        // TODO: cycle depth at focused slot.
+    }
+
+    pub fn project_overview_focus_depth_further(&mut self) {
+        // TODO: cycle depth at focused slot.
+    }
+
+    /// Search warm project workspaces for a window by wl_surface.
+    fn find_wl_surface_in_warm_projects<'a>(
+        projects: &'a [project::Project<W>],
+        wl_surface: &WlSurface,
+    ) -> Option<(&'a W, &'a str)> {
+        for project in projects {
+            if let project::ProjectKind::Warm { workspaces, .. } = &project.kind {
+                for ws in workspaces {
+                    if let Some(window) = ws.find_wl_surface(wl_surface) {
+                        return Some((window, &project.config.name));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_wl_surface_in_warm_projects_mut<'a>(
+        projects: &'a mut Vec<project::Project<W>>,
+        wl_surface: &WlSurface,
+    ) -> Option<(&'a mut W, &'a str)> {
+        for project in projects {
+            if let project::ProjectKind::Warm { workspaces, .. } = &mut project.kind {
+                for ws in workspaces {
+                    if let Some(window) = ws.find_wl_surface_mut(wl_surface) {
+                        return Some((window, &project.config.name));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Identifies which project a window belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectRef<'a> {
+    Active(&'a str),
+    Warm(&'a str),
 }
 
 impl<W: LayoutElement> Default for MonitorSet<W> {
