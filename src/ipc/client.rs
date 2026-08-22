@@ -42,6 +42,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             action: action.clone(),
         },
         Msg::Workspaces => Request::Workspaces,
+        Msg::Projects => Request::Projects,
         Msg::Windows => Request::Windows,
         Msg::Layers => Request::Layers,
         Msg::KeyboardLayouts => Request::KeyboardLayouts,
@@ -385,6 +386,46 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                     String::new()
                 };
                 println!("{is_active}{idx}{name}");
+            }
+        }
+        Msg::Projects => {
+            let Response::Projects(response) = response else {
+                bail!("unexpected response: expected Projects, got {response:?}");
+            };
+
+            if json {
+                let response =
+                    serde_json::to_string(&response).context("error formatting response")?;
+                println!("{response}");
+                return Ok(());
+            }
+
+            if response.is_empty() {
+                println!("No projects.");
+                return Ok(());
+            }
+
+            for (idx, project) in response.iter().enumerate() {
+                let is_active = if project.state == niri_ipc::ProjectState::Active {
+                    " * "
+                } else {
+                    "   "
+                };
+                let state = match project.state {
+                    niri_ipc::ProjectState::Active => "active".to_owned(),
+                    niri_ipc::ProjectState::Warm => "warm".to_owned(),
+                    niri_ipc::ProjectState::Dormant => "dormant".to_owned(),
+                };
+                let keep_open = if project.keep_open {
+                    " (keep-open)"
+                } else {
+                    ""
+                };
+                println!(
+                    "{is_active}{} \"{}\": {state}{keep_open}",
+                    idx + 1,
+                    project.name,
+                );
             }
         }
         Msg::KeyboardLayouts => {

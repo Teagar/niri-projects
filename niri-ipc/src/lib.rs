@@ -948,6 +948,15 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         project: String,
     },
+    /// Switch to the project at the given index in config order.
+    ///
+    /// Projects are the third spatial dimension: `Mod+Ctrl+N` maps to
+    /// project N (1-based), mirroring `Mod+N` for workspaces.
+    SwitchProjectByIndex {
+        /// Index of the project to switch to, starting from 1.
+        #[cfg_attr(feature = "clap", arg())]
+        index: usize,
+    },
     /// Close a project, returning it to dormant and killing its processes.
     ///
     /// Fails if the project is configured with keep-open; use

@@ -5284,6 +5284,15 @@ impl<W: LayoutElement> Layout<W> {
         })
     }
 
+    /// Switch to the project at the given 1-based index in config order.
+    pub fn switch_to_project_by_index(
+        &mut self,
+        index: usize,
+    ) -> Option<project::ProjectSwitchResult> {
+        let name = self.projects.get(index.checked_sub(1)?)?.name().to_string();
+        self.switch_to_project(&name)
+    }
+
     /// Close a project, destroying its warm workspaces.
     pub fn close_project(&mut self, name: &str) -> bool {
         let idx = match self.project_index(name) {

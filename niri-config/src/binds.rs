@@ -366,6 +366,7 @@ pub enum Action {
     OpenOverview,
     CloseOverview,
     SwitchProject(#[knuffel(argument)] String),
+    SwitchProjectByIndex(#[knuffel(argument)] usize),
     CloseProject(#[knuffel(argument)] String),
     #[knuffel(skip)]
     CloseProjectForce(String),
@@ -713,6 +714,7 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::OpenOverview {} => Self::OpenOverview,
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,
             niri_ipc::Action::SwitchProject { project } => Self::SwitchProject(project),
+            niri_ipc::Action::SwitchProjectByIndex { index } => Self::SwitchProjectByIndex(index),
             niri_ipc::Action::CloseProject { project }
             | niri_ipc::Action::CloseProjectForce { project } => Self::CloseProject(project),
             niri_ipc::Action::KeepProjectOpen { project } => Self::KeepProjectOpen(project),
