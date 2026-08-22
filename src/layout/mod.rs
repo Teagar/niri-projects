@@ -379,6 +379,10 @@ pub struct Layout<W: LayoutElement> {
     /// Name of the currently active project, if any.
     /// `None` means the implicit default desktop (no project boundaries).
     active_project_name: Option<String>,
+    /// Ids of the workspaces that belong to the active project while it is
+    /// attached to monitors. Used to park exactly the right workspaces on
+    /// switch-away without touching unrelated regular workspaces.
+    active_project_workspace_ids: Vec<WorkspaceId>,
     /// Monotonically increasing color index for the next newly-created project.
     next_project_color_index: usize,
 }
@@ -739,6 +743,7 @@ impl<W: LayoutElement> Layout<W> {
             options: Rc::new(options),
             projects: Vec::new(),
             active_project_name: None,
+            active_project_workspace_ids: Vec::new(),
             next_project_color_index: 0,
         }
     }
@@ -767,6 +772,7 @@ impl<W: LayoutElement> Layout<W> {
             options: opts,
             projects: Vec::new(),
             active_project_name: None,
+            active_project_workspace_ids: Vec::new(),
             next_project_color_index: 0,
         }
     }
@@ -5031,7 +5037,22 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn has_window(&self, window: &W::Id) -> bool {
-        self.windows().any(|(_, win)| win.id() == window)
+        if self.windows().any(|(_, win)| win.id() == window) {
+            return true;
+        }
+
+        // Also check warm project workspaces.
+        for project in &self.projects {
+            if let project::ProjectKind::Warm { workspaces, .. } = &project.kind {
+                for ws in workspaces {
+                    if ws.has_window(window) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     pub fn is_overview_open(&self) -> bool {
@@ -5081,6 +5102,10 @@ impl<W: LayoutElement> Layout<W> {
     /// them from attached to warm.  If there is no active project, this is a
     /// no-op.
     fn park_active_project(&mut self) {
+        if self.active_project_workspace_ids.is_empty() {
+            return;
+        }
+
         let name = match &self.active_project_name {
             Some(name) => name.clone(),
             None => return,
@@ -5096,16 +5121,10 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         let mon = &mut monitors[*active_monitor_idx];
-
-        let project_ws_ids: Vec<WorkspaceId> = mon
-            .workspaces
-            .iter()
-            .filter(|ws| ws.has_windows_or_name())
-            .map(|ws| ws.id())
-            .collect();
-
-        let parked = mon.take_workspaces_by_id(&project_ws_ids);
+        let parked = mon.take_workspaces_by_id(&self.active_project_workspace_ids);
         let active_idx = mon.active_workspace_idx;
+
+        self.active_project_workspace_ids.clear();
 
         if !parked.is_empty() {
             if let Some(idx) = self.project_index(&name) {
@@ -5116,6 +5135,10 @@ impl<W: LayoutElement> Layout<W> {
 
     /// Park the active project then destroy its workspaces (for closing).
     fn park_active_project_then_destroy(&mut self) {
+        if self.active_project_workspace_ids.is_empty() {
+            return;
+        }
+
         let MonitorSet::Normal {
             monitors,
             active_monitor_idx,
@@ -5127,15 +5150,9 @@ impl<W: LayoutElement> Layout<W> {
 
         let mon = &mut monitors[*active_monitor_idx];
 
-        let project_ws_ids: Vec<WorkspaceId> = mon
-            .workspaces
-            .iter()
-            .filter(|ws| ws.has_windows_or_name())
-            .map(|ws| ws.id())
-            .collect();
-
-        // Just remove; don't store them (dropping = destroying).
-        mon.take_workspaces_by_id(&project_ws_ids);
+        // Just remove without storing — drop = destroy.
+        mon.take_workspaces_by_id(&self.active_project_workspace_ids);
+        self.active_project_workspace_ids.clear();
     }
 
     /// Switch to the named project.  Returns the startup commands if the
@@ -5183,18 +5200,34 @@ impl<W: LayoutElement> Layout<W> {
         if was_warm {
             // Re-attach parked workspaces.
             let count = parked_ws.len();
+            let mut inserted_ids = Vec::new();
             for (i, mut ws) in parked_ws.into_iter().enumerate() {
+                let id = ws.id();
                 ws.set_output(Some(output.clone()));
                 ws.update_config(mon.options.clone());
                 // Insert in reverse so they end up in original order.
                 let insert_idx = count - 1 - i;
                 mon.insert_workspace(ws, insert_idx, insert_idx == 0);
+                inserted_ids.push(id);
             }
+            self.active_project_name = Some(project_name.clone());
+            self.active_project_workspace_ids = inserted_ids;
         } else {
             // Create workspaces from config for dormant projects.
+            // Always create at least one workspace so the project has a
+            // visible home for windows.
             let clock = self.clock.clone();
             let options = mon.options.clone();
-            for (i, ws_cfg) in self.projects[idx].config.workspaces.iter().enumerate() {
+            let ws_configs: Vec<_> = if self.projects[idx].config.workspaces.is_empty() {
+                vec![niri_config::ProjectWorkspaceConfig {
+                    name: project_name.clone(),
+                    spawn_at_startup: vec![],
+                }]
+            } else {
+                self.projects[idx].config.workspaces.clone()
+            };
+            let mut inserted_ids = Vec::new();
+            for (i, ws_cfg) in ws_configs.iter().enumerate() {
                 let ws_config = niri_config::Workspace {
                     name: niri_config::workspace::WorkspaceName(ws_cfg.name.clone()),
                     open_on_output: None,
@@ -5206,11 +5239,13 @@ impl<W: LayoutElement> Layout<W> {
                     clock.clone(),
                     options.clone(),
                 );
+                let id = ws.id();
                 mon.insert_workspace(ws, i, i == 0);
+                inserted_ids.push(id);
             }
+            self.active_project_name = Some(project_name.clone());
+            self.active_project_workspace_ids = inserted_ids;
         }
-
-        self.active_project_name = Some(project_name.clone());
 
         Some(project::ProjectSwitchResult {
             activated_name: project_name,
