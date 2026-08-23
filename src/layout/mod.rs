@@ -5179,26 +5179,20 @@ impl<W: LayoutElement> Layout<W> {
 
         let mon = &mut monitors[*active_monitor_idx];
 
-        // Compute which project workspace was active BEFORE parking.
-        let active_ws_id = mon
-            .workspaces
-            .get(mon.active_workspace_idx)
-            .map(|ws| ws.id());
-        let active_project_idx = active_ws_id
-            .filter(|id| self.active_project_workspace_ids.contains(id))
-            .and_then(|id| {
-                self.active_project_workspace_ids
-                    .iter()
-                    .position(|pid| *pid == id)
-            })
-            .unwrap_or(0);
+        // While a project is active the monitor holds ONLY project
+        // workspaces, so everything resident belongs to it.
+        let all_ws: Vec<_> = mem::take(&mut mon.workspaces);
+        let active_idx = mon.active_workspace_idx.min(all_ws.len().saturating_sub(1));
 
-        let parked = mon.take_workspaces_by_id(&self.active_project_workspace_ids);
+        // Restore the regular workspace set saved at activation time.
+        let regular_ws = mon.saved_regular_workspaces.take().unwrap_or_default();
+        mon.replace_workspaces(regular_ws);
+
         self.active_project_workspace_ids.clear();
 
-        if !parked.is_empty() {
+        if !all_ws.is_empty() {
             if let Some(idx) = self.project_index(&name) {
-                self.projects[idx].park_workspaces(parked, active_project_idx);
+                self.projects[idx].park_workspaces(all_ws, active_idx);
             }
         }
     }
@@ -5220,8 +5214,14 @@ impl<W: LayoutElement> Layout<W> {
 
         let mon = &mut monitors[*active_monitor_idx];
 
-        // Just remove without storing — drop = destroy.
-        mon.take_workspaces_by_id(&self.active_project_workspace_ids);
+        // Drop everything resident — it all belongs to the project.
+        let dropped: Vec<_> = mem::take(&mut mon.workspaces);
+        drop(dropped);
+
+        // Restore the regular workspace set.
+        let regular_ws = mon.saved_regular_workspaces.take().unwrap_or_default();
+        mon.replace_workspaces(regular_ws);
+
         self.active_project_workspace_ids.clear();
     }
 
@@ -5268,35 +5268,25 @@ impl<W: LayoutElement> Layout<W> {
         let output = mon.output.clone();
 
         if was_warm {
-            // Re-attach parked workspaces: project workspaces at the front,
-            // regular workspaces pushed to the back.  This avoids the old
-            // interleaving bug where `insert_workspace` with shifting indices
-            // scrambled the workspace order.
-            let regular_ws: Vec<_> = mem::take(&mut mon.workspaces);
+            // Save regular workspaces aside; project ws go on exclusively.
+            mon.saved_regular_workspaces = Some(mem::take(&mut mon.workspaces));
 
-            let mut inserted_ids = Vec::new();
+            let mut project_ws = Vec::with_capacity(parked_ws.len());
+            let mut inserted_ids = Vec::with_capacity(parked_ws.len());
             for mut ws in parked_ws {
                 let id = ws.id();
                 ws.set_output(Some(output.clone()));
                 ws.update_config(mon.options.clone());
-                mon.workspaces.push(ws);
+                project_ws.push(ws);
                 inserted_ids.push(id);
             }
 
-            // Re-append regular workspaces at the end.
-            for ws in regular_ws {
-                mon.workspaces.push(ws);
-            }
+            let activate_idx = _parked_idx.min(project_ws.len().saturating_sub(1));
+            mon.replace_workspaces(project_ws);
+            mon.activate_workspace(activate_idx);
 
             self.active_project_name = Some(project_name.clone());
             self.active_project_workspace_ids = inserted_ids;
-
-            // Activate the workspace that was active when the project was parked.
-            mon.workspace_switch = None;
-            let activate_idx = self.projects[idx]
-                .parked_active_workspace_idx()
-                .min(mon.workspaces.len().saturating_sub(1));
-            mon.activate_workspace(activate_idx);
         } else {
             // Create workspaces from config for dormant projects.
             // Always create at least one workspace so the project has a
@@ -5312,11 +5302,11 @@ impl<W: LayoutElement> Layout<W> {
                 self.projects[idx].config.workspaces.clone()
             };
 
-            // Same strategy: drain regular workspaces, put project workspaces
-            // at the front, re-append regular at the back.
-            let regular_ws: Vec<_> = mem::take(&mut mon.workspaces);
+            // Save regular workspaces aside; project ws go on exclusively.
+            mon.saved_regular_workspaces = Some(mem::take(&mut mon.workspaces));
 
-            let mut inserted_ids = Vec::new();
+            let mut project_ws = Vec::with_capacity(ws_configs.len());
+            let mut inserted_ids = Vec::with_capacity(ws_configs.len());
             for ws_cfg in &ws_configs {
                 let ws_config = niri_config::Workspace {
                     name: niri_config::workspace::WorkspaceName(ws_cfg.name.clone()),
@@ -5331,21 +5321,15 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 let id = ws.id();
                 ws.set_output(Some(output.clone()));
-                mon.workspaces.push(ws);
+                project_ws.push(ws);
                 inserted_ids.push(id);
             }
 
-            // Re-append regular workspaces at the end.
-            for ws in regular_ws {
-                mon.workspaces.push(ws);
-            }
+            mon.replace_workspaces(project_ws);
+            mon.activate_workspace(0);
 
             self.active_project_name = Some(project_name.clone());
             self.active_project_workspace_ids = inserted_ids;
-
-            // Activate the first project workspace.
-            mon.workspace_switch = None;
-            mon.activate_workspace(0);
         }
 
         Some(project::ProjectSwitchResult {

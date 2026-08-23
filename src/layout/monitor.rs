@@ -158,6 +158,13 @@ pub struct Monitor<W: LayoutElement> {
     overview_progress: Option<OverviewProgress>,
     /// Cached project name label textures for the overview badges.
     project_labels: RefCell<ProjectLabelCache>,
+    /// Regular (non-project) workspaces saved aside while a project is active.
+    ///
+    /// While a project is active, this monitor holds ONLY the project's
+    /// workspaces; the regular set is parked here and restored when the
+    /// project deactivates. This guarantees windows cannot land outside the
+    /// active project while it is resident.
+    pub(super) saved_regular_workspaces: Option<Vec<Workspace<W>>>,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -430,6 +437,7 @@ impl<W: LayoutElement> Monitor<W> {
             overview_open: false,
             overview_progress: None,
             project_labels: RefCell::new(HashMap::new()),
+            saved_regular_workspaces: None,
             workspace_switch: None,
             clock,
             base_options,
@@ -525,6 +533,17 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn add_workspace_bottom(&mut self) {
         self.add_workspace_at(self.workspaces.len());
+    }
+
+    /// Swap in a whole new workspace list, resetting view state.
+    ///
+    /// Used by project activation/parking where the entire residency set of
+    /// this monitor changes atomically.
+    pub(super) fn replace_workspaces(&mut self, workspaces: Vec<Workspace<W>>) {
+        self.workspaces = workspaces;
+        self.active_workspace_idx = 0;
+        self.workspace_switch = None;
+        self.previous_workspace_id = None;
     }
 
     pub fn activate_workspace(&mut self, idx: usize) {
@@ -786,6 +805,7 @@ impl<W: LayoutElement> Monitor<W> {
     ///
     /// Used for parking project workspaces when switching projects. Adjusts
     /// the active workspace index and cancels any in-flight workspace switch.
+    #[allow(dead_code)]
     pub(super) fn take_workspaces_by_id(&mut self, ids: &[WorkspaceId]) -> Vec<Workspace<W>> {
         let mut removed = Vec::new();
 
