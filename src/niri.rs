@@ -4161,6 +4161,7 @@ impl Niri {
                     let bg_color = ws.render_background().color();
                     state.xray.workspaces.push((geo, bg_color));
                 }
+                state.xray.suppress_shadows = self.layout.is_overview_open();
                 state.xray.backdrop_color = state.backdrop_buffer.color();
                 let blur_options = BlurOptions::from(self.config.borrow().blur);
                 for buf in &state.xray.background {

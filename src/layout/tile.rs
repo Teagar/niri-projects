@@ -1334,7 +1334,7 @@ impl<W: LayoutElement> Tile<W> {
                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
         }
 
-        if expanded_progress < 1. {
+        if expanded_progress < 1. && !ctx.xray.is_some_and(|xray| xray.suppress_shadows) {
             self.shadow
                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
         }

@@ -28,6 +28,8 @@ pub struct Xray {
     pub backdrop: [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT],
     pub backdrop_color: Color32F,
     pub workspaces: Vec<(Rectangle<f64, Logical>, Color32F)>,
+    /// Whether tile shadows should be suppressed for this render pass (e.g. project overview).
+    pub suppress_shadows: bool,
 }
 
 /// Position for drawing xray background.
@@ -90,6 +92,7 @@ impl Xray {
             backdrop: array::from_fn(|_| Rc::new(RefCell::new(EffectBuffer::new()))),
             backdrop_color: Color32F::TRANSPARENT,
             workspaces: Vec::new(),
+            suppress_shadows: false,
         }
     }
 
