@@ -5422,15 +5422,60 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn toggle_project_overview(&mut self) {
         if !self.is_overview_open() {
-            // Opening: initialize depth state.
+            // Opening: initialize depth state and lift the focused stack.
             self.init_project_overview_depth();
+            self.project_overview_reset_anims();
+            self.toggle_overview();
+            self.project_overview_sync_focus_anim();
+        } else {
+            self.toggle_overview();
         }
-        self.toggle_overview();
+    }
+
+    /// Animate the focused stack rising and all other stacks settling.
+    fn project_overview_sync_focus_anim(&mut self) {
+        let slot = self.project_overview_focused_slot;
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return;
+        };
+        for mon in monitors {
+            mon.project_overview_animate_focus(slot);
+        }
+    }
+
+    /// Clear all project overview fan animation state on every monitor.
+    fn project_overview_reset_anims(&mut self) {
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return;
+        };
+        for mon in monitors {
+            mon.project_overview_reset_anims();
+        }
+    }
+
+    /// Rotate the fan front of `slot` by `dir` steps, animating the shuffle.
+    fn project_overview_cycle_depth(&mut self, slot: usize, dir: isize) {
+        let len = self.projects_at_slot(slot).len();
+        if len < 2 {
+            return;
+        }
+        let Some(front) = self.project_overview_depth.get_mut(slot) else {
+            return;
+        };
+        *front = (*front as isize + dir).rem_euclid(len as isize) as usize;
+
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return;
+        };
+        for mon in monitors {
+            mon.project_overview_animate_depth_shift(slot, dir);
+        }
     }
 
     pub fn project_overview_focus_slot_prev(&mut self) {
         if self.project_overview_focused_slot > 0 {
             self.project_overview_focused_slot -= 1;
+            self.project_overview_sync_focus_anim();
         }
     }
 
@@ -5438,23 +5483,16 @@ impl<W: LayoutElement> Layout<W> {
         let max_slot = self.project_overview_depth.len().saturating_sub(1);
         if self.project_overview_focused_slot < max_slot {
             self.project_overview_focused_slot += 1;
+            self.project_overview_sync_focus_anim();
         }
     }
 
     pub fn project_overview_focus_depth_closer(&mut self) {
-        let slot = self.project_overview_focused_slot;
-        let len = self.projects_at_slot(slot).len();
-        if len > 0 && slot < self.project_overview_depth.len() {
-            self.project_overview_depth[slot] = (self.project_overview_depth[slot] + 1) % len;
-        }
+        self.project_overview_cycle_depth(self.project_overview_focused_slot, 1);
     }
 
     pub fn project_overview_focus_depth_further(&mut self) {
-        let slot = self.project_overview_focused_slot;
-        let len = self.projects_at_slot(slot).len();
-        if len > 0 && slot < self.project_overview_depth.len() {
-            self.project_overview_depth[slot] = (self.project_overview_depth[slot] + len - 1) % len;
-        }
+        self.project_overview_cycle_depth(self.project_overview_focused_slot, -1);
     }
 
     /// Render the stacked project overview cards for one output.
@@ -5530,14 +5568,17 @@ impl<W: LayoutElement> Layout<W> {
             .max()
             .unwrap_or(0);
 
-        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
-            return;
-        };
-        let Some(mon) = monitors.iter_mut().find(|mon| mon.output == *output) else {
-            return;
+        let slot = {
+            let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+                return;
+            };
+            let Some(mon) = monitors.iter_mut().find(|mon| mon.output == *output) else {
+                return;
+            };
+            mon.slot_index_at(pos_within_output, max_slot)
         };
 
-        let Some(slot) = mon.slot_index_at(pos_within_output, max_slot) else {
+        let Some(slot) = slot else {
             return;
         };
 
@@ -5545,15 +5586,8 @@ impl<W: LayoutElement> Layout<W> {
             self.init_project_overview_depth();
         }
         self.project_overview_focused_slot = slot;
-
-        let len = self.projects_at_slot(slot).len();
-        if len > 0 && slot < self.project_overview_depth.len() {
-            self.project_overview_depth[slot] = if closer {
-                (self.project_overview_depth[slot] + 1) % len
-            } else {
-                (self.project_overview_depth[slot] + len - 1) % len
-            };
-        }
+        self.project_overview_sync_focus_anim();
+        self.project_overview_cycle_depth(slot, if closer { 1 } else { -1 });
     }
 
     /// Search warm project workspaces for a window by wl_surface.

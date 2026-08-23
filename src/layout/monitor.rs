@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::collections::HashMap;
 use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use super::{
     compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options, ProjectOverviewEntry,
     ProjectOverviewItem,
 };
-use crate::animation::{Animation, Clock};
+use crate::animation::{Animation, Clock, Curve};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::RenderLayer;
 use crate::niri_render_elements;
@@ -50,9 +51,19 @@ const WORKSPACE_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
 const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 
 /// Horizontal fan offset between stacked project overview cards, in screen pixels.
-const PROJECT_OVERVIEW_FAN_STEP_X: f64 = 26.;
+const PROJECT_OVERVIEW_FAN_STEP_X: f64 = 20.;
 /// Vertical fan offset between stacked project overview cards, in screen pixels.
-const PROJECT_OVERVIEW_FAN_STEP_Y: f64 = 16.;
+const PROJECT_OVERVIEW_FAN_STEP_Y: f64 = 14.;
+/// How much a card recedes in size for each depth step in the fan.
+const PROJECT_OVERVIEW_FAN_RECEDE: f64 = 0.07;
+/// Maximum depth at which cards are still drawn (deeper ones clamp to this pose).
+const PROJECT_OVERVIEW_MAX_POSE_DEPTH: f64 = 4.;
+/// Upward shift of the focused slot stack, in screen pixels.
+const PROJECT_OVERVIEW_FOCUS_LIFT_Y: f64 = 16.;
+/// Extra scale of the focused slot stack while lifted.
+const PROJECT_OVERVIEW_FOCUS_LIFT_SCALE: f64 = 1.03;
+/// Duration of the project overview fan animations, in ms.
+const PROJECT_OVERVIEW_ANIM_MS: u64 = 220;
 
 #[derive(Debug)]
 pub struct Monitor<W: LayoutElement> {
@@ -89,6 +100,13 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    /// Per-slot depth-cycle animations for the project overview fan.
+    ///
+    /// After each depth rotation the animation value glides back to 0; the
+    /// displayed depth of a card is its static depth plus this shift.
+    project_slot_shifts: HashMap<usize, Option<Animation>>,
+    /// Per-slot animated lift (0..1) of the focused stack.
+    project_slot_lifts: HashMap<usize, Animation>,
     /// Regular (non-project) workspaces saved aside while a project is active.
     ///
     /// While a project is active, this monitor holds ONLY the project's
@@ -357,6 +375,8 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            project_slot_shifts: HashMap::new(),
+            project_slot_lifts: HashMap::new(),
             saved_regular_workspaces: None,
             workspace_switch: None,
             clock,
@@ -1133,6 +1153,11 @@ impl<W: LayoutElement> Monitor<W> {
             None => (),
         }
 
+        self.project_slot_shifts
+            .retain(|_, shift| shift.as_ref().is_some_and(|anim| !anim.is_done()));
+        self.project_slot_lifts
+            .retain(|_, anim| !(anim.is_done() && anim.clamped_value() <= 0.));
+
         for ws in &mut self.workspaces {
             ws.advance_animations();
         }
@@ -1142,6 +1167,11 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
+            || self
+                .project_slot_lifts
+                .values()
+                .chain(self.project_slot_shifts.values().flatten())
+                .any(|anim| !anim.is_done())
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
@@ -1914,6 +1944,68 @@ impl<W: LayoutElement> Monitor<W> {
         (slot < max_slot).then_some(slot)
     }
 
+    /// Reset all project overview fan animation state.
+    pub(super) fn project_overview_reset_anims(&mut self) {
+        self.project_slot_shifts.clear();
+        self.project_slot_lifts.clear();
+    }
+
+    /// Animate the focused stack rising, and all other stacks settling back.
+    pub(super) fn project_overview_animate_focus(&mut self, focused_slot: usize) {
+        let mut slots: Vec<usize> = self.project_slot_lifts.keys().copied().collect();
+        if !slots.contains(&focused_slot) {
+            slots.push(focused_slot);
+        }
+
+        for slot in slots {
+            let rising = slot == focused_slot;
+            let from = self
+                .project_slot_lifts
+                .get(&slot)
+                .map_or(0., Animation::clamped_value);
+            let to = if rising { 1. } else { 0. };
+            if !rising && from <= 0. {
+                self.project_slot_lifts.remove(&slot);
+                continue;
+            }
+            if from == to {
+                continue;
+            }
+            let anim = Animation::ease(
+                self.clock.clone(),
+                from,
+                to,
+                0.,
+                PROJECT_OVERVIEW_ANIM_MS,
+                Curve::EaseOutCubic,
+            );
+            self.project_slot_lifts.insert(slot, anim);
+        }
+    }
+
+    /// Animate the fan shuffle for a depth rotation in `slot`.
+    ///
+    /// The static depths were already rotated by `dir`; the shift animation
+    /// starts at `-dir` so cards appear to glide from their previous poses.
+    pub(super) fn project_overview_animate_depth_shift(&mut self, slot: usize, dir: isize) {
+        let prev = self
+            .project_slot_shifts
+            .get(&slot)
+            .and_then(Option::as_ref)
+            .map_or(0., Animation::clamped_value);
+
+        // An interrupted glide folds into the new one seamlessly.
+        let anim = Animation::ease(
+            self.clock.clone(),
+            prev - dir as f64,
+            0.,
+            0.,
+            PROJECT_OVERVIEW_ANIM_MS,
+            Curve::EaseOutCubic,
+        );
+        self.project_slot_shifts.insert(slot, Some(anim));
+    }
+
     /// Render the stacked project overview cards.
     ///
     /// Card contents (warm workspaces) go through `push`.
@@ -1948,30 +2040,73 @@ impl<W: LayoutElement> Monitor<W> {
         let first_ws_y = -self.workspace_render_idx() * ws_height_with_gap;
         let first_ws_y = round_logical_in_physical(scale, first_ws_y);
 
-        // Deepest cards first so the selected (lowest depth) card ends up on top.
-        let mut ordered: Vec<&ProjectOverviewEntry<W>> = entries.iter().collect();
-        ordered.sort_by_key(|entry| std::cmp::Reverse(entry.depth));
-
         // Crop to an infinite-width, workspace-high region like the overview pass above.
         let crop_bounds = Rectangle::new(
             Point::from((-i32::MAX / 2, 0)),
             Size::from((i32::MAX, height)),
         );
 
-        for entry in ordered {
-            let y = first_ws_y + entry.slot as f64 * ws_height_with_gap;
+        // Group entries by slot, keeping their order.
+        let mut by_slot: Vec<(usize, Vec<&ProjectOverviewEntry<W>>)> = Vec::new();
+        for entry in entries {
+            match by_slot.last_mut() {
+                Some((slot, stack)) if *slot == entry.slot => stack.push(entry),
+                _ => by_slot.push((entry.slot, vec![entry])),
+            }
+        }
+
+        for (slot, stack) in by_slot {
+            let len = stack.len() as f64;
+
+            let shift = self
+                .project_slot_shifts
+                .get(&slot)
+                .and_then(Option::as_ref)
+                .map_or(0., Animation::clamped_value);
+            let lift = self
+                .project_slot_lifts
+                .get(&slot)
+                .map_or(0., Animation::clamped_value);
+
+            let y = first_ws_y + slot as f64 * ws_height_with_gap;
             let base_loc: Point<f64, Logical> = Point::from((0., y)) + static_offset;
-
-            // The fan offset keeps a constant on-screen size across zoom levels.
-            let fan_dx = (entry.depth as f64 * PROJECT_OVERVIEW_FAN_STEP_X * scale).round() as i32;
-            let fan_dy = -(entry.depth as f64 * PROJECT_OVERVIEW_FAN_STEP_Y * scale).round() as i32;
             let base_phys: Point<i32, Physical> = base_loc.to_physical_precise_round(scale);
-            let relocate_loc =
-                Point::<i32, Physical>::from((base_phys.x + fan_dx, base_phys.y + fan_dy));
 
-            // ── Content ──────────────────────────────────────────────
-            match &entry.item {
-                ProjectOverviewItem::Warm(ws) => {
+            // Pose of a card at fractional fan depth: relocation offset and size
+            // factor. Deeper cards peek up-right like sheets in a folder and
+            // recede slightly; the focused stack rises toward the viewer.
+            let pose = |depth: f64| -> (Point<i32, Physical>, f64) {
+                let d = depth.clamp(0., PROJECT_OVERVIEW_MAX_POSE_DEPTH);
+                let recede = 1. / (1. + PROJECT_OVERVIEW_FAN_RECEDE * d);
+                let dx = (PROJECT_OVERVIEW_FAN_STEP_X * d * scale).round() as i32;
+                let dy = (-(PROJECT_OVERVIEW_FAN_STEP_Y * d)
+                    - PROJECT_OVERVIEW_FOCUS_LIFT_Y * lift)
+                    * scale;
+                let size_factor =
+                    zoom * recede * (1. + (PROJECT_OVERVIEW_FOCUS_LIFT_SCALE - 1.) * lift);
+                (
+                    Point::from((base_phys.x + dx, base_phys.y + dy.round() as i32)),
+                    size_factor,
+                )
+            };
+            let lerp_pose = |from_d: f64, to_d: f64, t: f64| -> (Point<i32, Physical>, f64) {
+                let (from_loc, from_size) = pose(from_d);
+                let (to_loc, to_size) = pose(to_d);
+                (
+                    Point::from((
+                        (from_loc.x as f64 + (to_loc.x - from_loc.x) as f64 * t).round() as i32,
+                        (from_loc.y as f64 + (to_loc.y - from_loc.y) as f64 * t).round() as i32,
+                    )),
+                    from_size + (to_size - from_size) * t,
+                )
+            };
+
+            let render_card = |mut ctx: RenderCtx<R>,
+                               entry: &ProjectOverviewEntry<W>,
+                               loc: Point<i32, Physical>,
+                               size_factor: f64,
+                               push: &mut dyn FnMut(MonitorRenderElement<R>)| {
+                if let ProjectOverviewItem::Warm(ws) = &entry.item {
                     let xray_pos = XrayPos::new(base_loc, zoom);
 
                     let mut push_card = |elem: WorkspaceRenderElement<R>| {
@@ -1982,11 +2117,11 @@ impl<W: LayoutElement> Monitor<W> {
                             let scaled = RescaleRenderElement::from_element(
                                 inner,
                                 Point::from((0, 0)),
-                                zoom,
+                                size_factor,
                             );
                             push(RelocateRenderElement::from_element(
                                 scaled,
-                                relocate_loc,
+                                loc,
                                 Relocate::Relative,
                             ));
                         }
@@ -2007,7 +2142,57 @@ impl<W: LayoutElement> Monitor<W> {
                         &mut push_card,
                     );
                 }
-                ProjectOverviewItem::Placeholder => {}
+            };
+
+            // Compute each card's animated display depth. During a shuffle the
+            // wrapping card doesn't teleport through the deck: the card coming
+            // to the front pulls out over the stack, the one leaving the front
+            // tucks underneath it.
+            enum Wrap {
+                /// Deep → front; drawn on top. `t` goes 0 → 1.
+                PullOut { t: f64 },
+                /// Front → deep; drawn underneath. `t` goes 0 → 1.
+                TuckUnder { t: f64 },
+            }
+
+            let mut cards: Vec<(&ProjectOverviewEntry<W>, f64, Option<Wrap>)> = Vec::new();
+            for entry in &stack {
+                let d = entry.depth as f64 + shift;
+                let wrap = if d < 0. {
+                    Some(Wrap::PullOut { t: 1. + d })
+                } else if d >= len {
+                    Some(Wrap::TuckUnder { t: d - (len - 1.) })
+                } else {
+                    None
+                };
+                cards.push((entry, d, wrap));
+            }
+
+            // Tuck-under first (bottom of the z stack).
+            for (entry, _, wrap) in &cards {
+                if let Some(Wrap::TuckUnder { t }) = wrap {
+                    let (loc, size) = lerp_pose(0., len - 1., *t);
+                    render_card(ctx.r(), entry, loc, size, push);
+                }
+            }
+
+            // Regular cards, deepest first so shallower ones draw on top.
+            let mut regular: Vec<_> = cards
+                .iter()
+                .filter(|(_, _, wrap)| wrap.is_none())
+                .collect();
+            regular.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (entry, d, _) in regular {
+                let (loc, size) = pose(*d);
+                render_card(ctx.r(), entry, loc, size, push);
+            }
+
+            // Pull-out last (top of the z stack).
+            for (entry, _, wrap) in &cards {
+                if let Some(Wrap::PullOut { t }) = wrap {
+                    let (loc, size) = lerp_pose(len - 1., 0., *t);
+                    render_card(ctx.r(), entry, loc, size, push);
+                }
             }
         }
     }
