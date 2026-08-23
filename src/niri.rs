@@ -4508,7 +4508,9 @@ impl Niri {
             }
         }
 
-        mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
+        if !self.layout.is_overview_open() {
+            mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
+        }
 
         // Then the backdrop.
         push_popups_from_layer!(Layer::Background, true);
