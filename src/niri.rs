@@ -4417,6 +4417,22 @@ impl Niri {
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
 
+            let project_overview_push = core::cell::RefCell::new(&mut *push);
+            self.layout.render_project_overview_for_output(
+                ctx.r(),
+                output,
+                focus_ring,
+                &mut |elem| (project_overview_push.borrow_mut())(elem.into()),
+                &mut |elem| match elem {
+                    crate::layout::ProjectOverviewDecorElement::SolidColor(elem) => {
+                        (project_overview_push.borrow_mut())(elem.into())
+                    }
+                    crate::layout::ProjectOverviewDecorElement::Texture(elem) => {
+                        (project_overview_push.borrow_mut())(elem.into())
+                    }
+                },
+            );
+
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
 
@@ -4457,6 +4473,22 @@ impl Niri {
             }
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+
+            let project_overview_push = core::cell::RefCell::new(&mut *push);
+            self.layout.render_project_overview_for_output(
+                ctx.r(),
+                output,
+                focus_ring,
+                &mut |elem| (project_overview_push.borrow_mut())(elem.into()),
+                &mut |elem| match elem {
+                    crate::layout::ProjectOverviewDecorElement::SolidColor(elem) => {
+                        (project_overview_push.borrow_mut())(elem.into())
+                    }
+                    crate::layout::ProjectOverviewDecorElement::Texture(elem) => {
+                        (project_overview_push.borrow_mut())(elem.into())
+                    }
+                },
+            );
 
             for (ws, geo) in mon.workspaces_with_render_geo() {
                 // The render element namespace. This will be set to the workspace index for

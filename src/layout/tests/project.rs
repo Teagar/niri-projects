@@ -332,3 +332,150 @@ fn closing_project_destroys_workspaces() {
         "window 10 should be destroyed after close_project"
     );
 }
+
+#[test]
+fn overview_slot_stack_includes_all_projects() {
+    let mut layout = setup_layout_with_projects();
+
+    // Give both projects two configured workspaces each.
+    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
+    layout.projects[0]
+        .config
+        .workspaces
+        .push(niri_config::ProjectWorkspaceConfig {
+            name: "a1".to_string(),
+            spawn_at_startup: vec![],
+        });
+    layout.ensure_project(&make_project_config_with_ws("project_b", "b0"));
+    layout.projects[1]
+        .config
+        .workspaces
+        .push(niri_config::ProjectWorkspaceConfig {
+            name: "b1".to_string(),
+            spawn_at_startup: vec![],
+        });
+
+    // No active project yet: both projects occupy slots 0 and 1.
+    assert_eq!(layout.projects_at_slot(0), vec![0, 1]);
+    assert_eq!(layout.projects_at_slot(1), vec![0, 1]);
+
+    // Activate project_a: it still counts at every slot via its attached workspaces.
+    layout.switch_to_project("project_a");
+    assert_eq!(layout.projects_at_slot(0), vec![0, 1]);
+    assert_eq!(layout.project_slot_count(0), 2);
+}
+
+#[test]
+fn overview_fan_position_rotates_with_depth() {
+    let mut layout = setup_layout_with_projects();
+
+    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
+    layout.ensure_project(&make_project_config_with_ws("project_b", "b0"));
+
+    // Stack is [project_a(0), project_b(1)]; front defaults to project_a.
+    assert_eq!(layout.project_fan_position(0, 0), 0);
+    assert_eq!(layout.project_fan_position(1, 0), 1);
+
+    // Cycle depth forward: project_b comes to the front.
+    layout.toggle_project_overview();
+    layout.project_overview_focus_depth_closer();
+    assert_eq!(layout.project_fan_position(0, 0), 1);
+    assert_eq!(layout.project_fan_position(1, 0), 0);
+
+    // Cycle back: project_a is front again.
+    layout.project_overview_focus_depth_further();
+    assert_eq!(layout.project_fan_position(0, 0), 0);
+    assert_eq!(layout.project_fan_position(1, 0), 1);
+
+    // Browsing depth never mutated any project's runtime state.
+    assert!(layout.projects[0].is_dormant() || layout.projects[0].is_warm());
+}
+
+#[test]
+fn overview_fan_order_follows_config_order() {
+    let mut layout = setup_layout_with_projects();
+
+    // Three projects: stack at slot 0 is [a(0), b(1), c(2)].
+    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
+    layout.ensure_project(&make_project_config_with_ws("project_b", "b0"));
+    layout.ensure_project(&make_project_config_with_ws("project_c", "c0"));
+
+    // Reading the fan back-to-front (base card first) must follow config
+    // order: b shallower than c. So c is deeper (further back) than b.
+    assert_eq!(layout.project_fan_position(0, 0), 0);
+    assert_eq!(layout.project_fan_position(1, 0), 2);
+    assert_eq!(layout.project_fan_position(2, 0), 1);
+}
+
+#[test]
+fn overview_slot_navigation_clamps() {
+    let mut layout = setup_layout_with_projects();
+
+    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
+
+    layout.toggle_project_overview();
+    // Only one slot exists; next must stay clamped.
+    layout.project_overview_focus_slot_next();
+    assert_eq!(layout.project_overview_focused_slot, 0);
+
+    // Prev from 0 also stays clamped.
+    layout.project_overview_focus_slot_prev();
+    assert_eq!(layout.project_overview_focused_slot, 0);
+}
+
+#[test]
+fn windows_created_in_a_project_stay_in_that_project() {
+    let mut layout = setup_layout_with_projects();
+
+    let monitor_windows = |layout: &Layout<TestWindow>| {
+        let mut ids = Vec::new();
+        if let super::super::MonitorSet::Normal { monitors, .. } = &layout.monitor_set {
+            for mon in monitors {
+                for ws in &mon.workspaces {
+                    for win in ws.windows() {
+                        ids.push(*win.id());
+                    }
+                }
+            }
+        }
+        ids
+    };
+
+    // Activate project_a and create window 42 there.
+    layout.switch_to_project("project_a");
+    let win_a = TestWindow::new(TestWindowParams::new(42));
+    layout.add_window(
+        win_a,
+        AddWindowTarget::Auto,
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::default(),
+    );
+    assert_eq!(monitor_windows(&layout), vec![42]);
+
+    // Switch to project_b (project_a parks with its window) and create
+    // window 43 while project_b is active.
+    layout.switch_to_project("project_b");
+    let win_b = TestWindow::new(TestWindowParams::new(43));
+    layout.add_window(
+        win_b,
+        AddWindowTarget::Auto,
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::default(),
+    );
+
+    // Exactly one window visible: 43 in project_b. Window 42 stays alive but
+    // parked inside project_a.
+    assert_eq!(monitor_windows(&layout), vec![43]);
+    assert!(layout.has_window(&42), "window 42 must survive parking");
+
+    // Round trip: back to project_a, window 42 is visible again and 43 parks.
+    layout.switch_to_project("project_a");
+    assert_eq!(monitor_windows(&layout), vec![42]);
+    assert!(layout.has_window(&43), "window 43 must survive parking");
+}

@@ -3270,6 +3270,41 @@ impl State {
                     }
                 }
 
+                // Mod+scroll in the overview cycles the project depth stack of the
+                // slot under the cursor (up = bring card to front).
+                if should_handle_in_overview && modifiers == mod_key.to_modifiers() {
+                    let vertical = vertical_amount_v120.unwrap_or(0.);
+                    let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
+                    if ticks != 0 {
+                        let pointer = self.niri.seat.get_pointer().unwrap();
+                        let pos = pointer.current_location();
+                        let under = self
+                            .niri
+                            .output_under(pos)
+                            .map(|(output, pos)| (output.clone(), pos));
+                        if let Some((output, pos_within_output)) = under {
+                            for _ in 0..ticks {
+                                self.niri.layout.project_overview_depth_cycle_at_point(
+                                    &output,
+                                    pos_within_output,
+                                    false,
+                                );
+                            }
+                            for _ in ticks..0 {
+                                self.niri.layout.project_overview_depth_cycle_at_point(
+                                    &output,
+                                    pos_within_output,
+                                    true,
+                                );
+                            }
+                            self.niri.queue_redraw(&output);
+                        }
+                    }
+
+                    // Consume the event; Mod+scroll has no other meaning in the overview.
+                    return;
+                }
+
                 let vertical = vertical_amount_v120.unwrap_or(0.);
                 let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
                 if ticks != 0 {

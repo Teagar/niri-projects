@@ -374,9 +374,7 @@ pub enum Action {
     ToggleProjectOverview,
     ProjectOverviewFocusSlotPrev,
     ProjectOverviewFocusSlotNext,
-    #[knuffel(skip)]
     ProjectOverviewFocusDepthCloser,
-    #[knuffel(skip)]
     ProjectOverviewFocusDepthFurther,
     #[knuffel(skip)]
     ToggleWindowUrgent(u64),

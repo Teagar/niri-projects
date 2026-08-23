@@ -42,6 +42,18 @@ pub(super) enum ProjectKind<W: super::LayoutElement> {
     },
 }
 
+/// Stable overview card colors, cycled by `color_index`.
+pub const PROJECT_COLORS: [[f32; 3]; 8] = [
+    [0.42, 0.65, 0.92], // blue
+    [0.45, 0.80, 0.55], // green
+    [0.92, 0.62, 0.40], // orange
+    [0.75, 0.55, 0.90], // purple
+    [0.92, 0.55, 0.62], // pink
+    [0.45, 0.82, 0.82], // teal
+    [0.85, 0.80, 0.45], // yellow
+    [0.70, 0.72, 0.78], // gray
+];
+
 #[allow(dead_code)]
 impl<W: super::LayoutElement> Project<W> {
     pub fn new(config: ProjectConfig, color_index: usize) -> Self {
@@ -50,6 +62,11 @@ impl<W: super::LayoutElement> Project<W> {
             color_index,
             kind: ProjectKind::Dormant,
         }
+    }
+
+    /// Stable RGB color identifying this project in the overview.
+    pub fn color(&self) -> [f32; 3] {
+        PROJECT_COLORS[self.color_index % PROJECT_COLORS.len()]
     }
 
     pub fn name(&self) -> &str {
@@ -99,7 +116,18 @@ impl<W: super::LayoutElement> Project<W> {
             workspaces,
             active_workspace_idx,
             ids,
-        };
+        }
+    }
+
+    /// The workspace index that was active when the project was last parked.
+    pub fn parked_active_workspace_idx(&self) -> usize {
+        match &self.kind {
+            ProjectKind::Warm {
+                active_workspace_idx,
+                ..
+            } => *active_workspace_idx,
+            ProjectKind::Dormant => 0,
+        }
     }
 }
 

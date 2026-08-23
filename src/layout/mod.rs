@@ -52,8 +52,8 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
 use tile::{Tile, TileRenderElement};
 use workspace::{WorkspaceAddWindowTarget, WorkspaceId};
 
-pub use self::monitor::MonitorRenderElement;
 use self::monitor::{Monitor, WorkspaceSwitch};
+pub use self::monitor::{MonitorRenderElement, ProjectOverviewDecorElement};
 use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -385,6 +385,10 @@ pub struct Layout<W: LayoutElement> {
     active_project_workspace_ids: Vec<WorkspaceId>,
     /// Monotonically increasing color index for the next newly-created project.
     next_project_color_index: usize,
+    /// Focused slot index in the project overview (which workspace slot column).
+    project_overview_focused_slot: usize,
+    /// Depth index per slot in the project overview (which project is on top).
+    project_overview_depth: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -585,6 +589,25 @@ pub enum RenderLayer {
     MovingBetweenWorkspaces,
 }
 
+/// One card in the project overview: a live warm workspace or a placeholder for a dormant one.
+pub(super) enum ProjectOverviewItem<'a, W: LayoutElement> {
+    /// Parked workspace with live windows, rendered in full.
+    Warm(&'a Workspace<W>),
+    /// Dormant project placeholder (no live content).
+    Placeholder,
+}
+
+/// A single stacked card at a slot in the project overview.
+pub(super) struct ProjectOverviewEntry<'a, W: LayoutElement> {
+    /// Slot index (vertical position, matching the active workspace slots).
+    pub slot: usize,
+    /// Fan position: 0 is the front card, higher values fan out behind.
+    pub depth: usize,
+    /// Project name for the label badge.
+    pub name: String,
+    pub item: ProjectOverviewItem<'a, W>,
+}
+
 impl SizingMode {
     #[must_use]
     pub fn is_normal(&self) -> bool {
@@ -753,6 +776,8 @@ impl<W: LayoutElement> Layout<W> {
             active_project_name: None,
             active_project_workspace_ids: Vec::new(),
             next_project_color_index: 0,
+            project_overview_focused_slot: 0,
+            project_overview_depth: Vec::new(),
         }
     }
 
@@ -782,6 +807,8 @@ impl<W: LayoutElement> Layout<W> {
             active_project_name: None,
             active_project_workspace_ids: Vec::new(),
             next_project_color_index: 0,
+            project_overview_focused_slot: 0,
+            project_overview_depth: Vec::new(),
         }
     }
 
@@ -5151,14 +5178,27 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         let mon = &mut monitors[*active_monitor_idx];
-        let parked = mon.take_workspaces_by_id(&self.active_project_workspace_ids);
-        let active_idx = mon.active_workspace_idx;
 
+        // Compute which project workspace was active BEFORE parking.
+        let active_ws_id = mon
+            .workspaces
+            .get(mon.active_workspace_idx)
+            .map(|ws| ws.id());
+        let active_project_idx = active_ws_id
+            .filter(|id| self.active_project_workspace_ids.contains(id))
+            .and_then(|id| {
+                self.active_project_workspace_ids
+                    .iter()
+                    .position(|pid| *pid == id)
+            })
+            .unwrap_or(0);
+
+        let parked = mon.take_workspaces_by_id(&self.active_project_workspace_ids);
         self.active_project_workspace_ids.clear();
 
         if !parked.is_empty() {
             if let Some(idx) = self.project_index(&name) {
-                self.projects[idx].park_workspaces(parked, active_idx);
+                self.projects[idx].park_workspaces(parked, active_project_idx);
             }
         }
     }
@@ -5228,20 +5268,35 @@ impl<W: LayoutElement> Layout<W> {
         let output = mon.output.clone();
 
         if was_warm {
-            // Re-attach parked workspaces.
-            let count = parked_ws.len();
+            // Re-attach parked workspaces: project workspaces at the front,
+            // regular workspaces pushed to the back.  This avoids the old
+            // interleaving bug where `insert_workspace` with shifting indices
+            // scrambled the workspace order.
+            let regular_ws: Vec<_> = mem::take(&mut mon.workspaces);
+
             let mut inserted_ids = Vec::new();
-            for (i, mut ws) in parked_ws.into_iter().enumerate() {
+            for mut ws in parked_ws {
                 let id = ws.id();
                 ws.set_output(Some(output.clone()));
                 ws.update_config(mon.options.clone());
-                // Insert in reverse so they end up in original order.
-                let insert_idx = count - 1 - i;
-                mon.insert_workspace(ws, insert_idx, insert_idx == 0);
+                mon.workspaces.push(ws);
                 inserted_ids.push(id);
             }
+
+            // Re-append regular workspaces at the end.
+            for ws in regular_ws {
+                mon.workspaces.push(ws);
+            }
+
             self.active_project_name = Some(project_name.clone());
             self.active_project_workspace_ids = inserted_ids;
+
+            // Activate the workspace that was active when the project was parked.
+            mon.workspace_switch = None;
+            let activate_idx = self.projects[idx]
+                .parked_active_workspace_idx()
+                .min(mon.workspaces.len().saturating_sub(1));
+            mon.activate_workspace(activate_idx);
         } else {
             // Create workspaces from config for dormant projects.
             // Always create at least one workspace so the project has a
@@ -5256,25 +5311,41 @@ impl<W: LayoutElement> Layout<W> {
             } else {
                 self.projects[idx].config.workspaces.clone()
             };
+
+            // Same strategy: drain regular workspaces, put project workspaces
+            // at the front, re-append regular at the back.
+            let regular_ws: Vec<_> = mem::take(&mut mon.workspaces);
+
             let mut inserted_ids = Vec::new();
-            for (i, ws_cfg) in ws_configs.iter().enumerate() {
+            for ws_cfg in &ws_configs {
                 let ws_config = niri_config::Workspace {
                     name: niri_config::workspace::WorkspaceName(ws_cfg.name.clone()),
                     open_on_output: None,
                     layout: None,
                 };
-                let ws = Workspace::new_with_config(
+                let mut ws = Workspace::new_with_config(
                     output.clone(),
                     Some(ws_config),
                     clock.clone(),
                     options.clone(),
                 );
                 let id = ws.id();
-                mon.insert_workspace(ws, i, i == 0);
+                ws.set_output(Some(output.clone()));
+                mon.workspaces.push(ws);
                 inserted_ids.push(id);
             }
+
+            // Re-append regular workspaces at the end.
+            for ws in regular_ws {
+                mon.workspaces.push(ws);
+            }
+
             self.active_project_name = Some(project_name.clone());
             self.active_project_workspace_ids = inserted_ids;
+
+            // Activate the first project workspace.
+            mon.workspace_switch = None;
+            mon.activate_workspace(0);
         }
 
         Some(project::ProjectSwitchResult {
@@ -5312,26 +5383,199 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
-    // ── Project overview stubs ──────────────────────────────────────────
+    // ── Project overview ──────────────────────────────────────────────────
+
+    /// Number of workspace slots a project occupies in the overview.
+    ///
+    /// The active project's workspaces are attached to monitors, so count them
+    /// from `active_project_workspace_ids` rather than from (stale) runtime kind.
+    fn project_slot_count(&self, pidx: usize) -> usize {
+        let project = &self.projects[pidx];
+        if self.active_project_name.as_deref() == Some(project.name()) {
+            self.active_project_workspace_ids.len()
+        } else {
+            match &project.kind {
+                project::ProjectKind::Dormant => project.config.workspaces.len(),
+                project::ProjectKind::Warm { workspaces, .. } => workspaces.len(),
+            }
+        }
+    }
+
+    /// Indices of projects that have a card at the given slot, in config order.
+    fn projects_at_slot(&self, slot: usize) -> Vec<usize> {
+        (0..self.projects.len())
+            .filter(|&pidx| slot < self.project_slot_count(pidx))
+            .collect()
+    }
+
+    /// Fan position of a project's card at a slot: 0 is front/on top.
+    ///
+    /// Non-active projects read outward from the active/base card in config
+    /// order: the project right after the active one is the shallowest card,
+    /// higher indices stack progressively deeper.
+    fn project_fan_position(&self, pidx: usize, slot: usize) -> usize {
+        let stack = self.projects_at_slot(slot);
+        if stack.is_empty() {
+            return 0;
+        }
+
+        let len = stack.len();
+        let front = self.project_overview_depth.get(slot).copied().unwrap_or(0) % len;
+        let pos_in_stack = stack.iter().position(|&i| i == pidx).unwrap_or(0);
+        (front + len - pos_in_stack) % len
+    }
+
+    /// Initialize depth state for project overview (one entry per slot).
+    fn init_project_overview_depth(&mut self) {
+        let max_slots = (0..self.projects.len())
+            .map(|pidx| self.project_slot_count(pidx))
+            .max()
+            .unwrap_or(0);
+
+        self.project_overview_depth.resize(max_slots, 0);
+        self.project_overview_focused_slot = self
+            .project_overview_focused_slot
+            .min(max_slots.saturating_sub(1));
+    }
 
     pub fn toggle_project_overview(&mut self) {
+        if !self.is_overview_open() {
+            // Opening: initialize depth state.
+            self.init_project_overview_depth();
+        }
         self.toggle_overview();
     }
 
     pub fn project_overview_focus_slot_prev(&mut self) {
-        // TODO: cycle focus between project slots in overview.
+        if self.project_overview_focused_slot > 0 {
+            self.project_overview_focused_slot -= 1;
+        }
     }
 
     pub fn project_overview_focus_slot_next(&mut self) {
-        // TODO: cycle focus between project slots in overview.
+        let max_slot = self.project_overview_depth.len().saturating_sub(1);
+        if self.project_overview_focused_slot < max_slot {
+            self.project_overview_focused_slot += 1;
+        }
     }
 
     pub fn project_overview_focus_depth_closer(&mut self) {
-        // TODO: cycle depth at focused slot.
+        let slot = self.project_overview_focused_slot;
+        let len = self.projects_at_slot(slot).len();
+        if len > 0 && slot < self.project_overview_depth.len() {
+            self.project_overview_depth[slot] = (self.project_overview_depth[slot] + 1) % len;
+        }
     }
 
     pub fn project_overview_focus_depth_further(&mut self) {
-        // TODO: cycle depth at focused slot.
+        let slot = self.project_overview_focused_slot;
+        let len = self.projects_at_slot(slot).len();
+        if len > 0 && slot < self.project_overview_depth.len() {
+            self.project_overview_depth[slot] = (self.project_overview_depth[slot] + len - 1) % len;
+        }
+    }
+
+    /// Render the stacked project overview cards for one output.
+    ///
+    /// The active project's workspaces are rendered by the regular overview
+    /// path; this renders every other project's cards fanned out per slot,
+    /// with dormant projects shown as solid placeholder cards.
+    pub fn render_project_overview_for_output<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        output: &Output,
+        focus_ring: bool,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+        push_decor: &mut dyn FnMut(ProjectOverviewDecorElement),
+    ) {
+        if !self.overview_open {
+            return;
+        }
+
+        let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
+            return;
+        };
+        let Some(mon) = monitors.iter().find(|mon| mon.output == *output) else {
+            return;
+        };
+
+        let mut entries = Vec::new();
+
+        for (pidx, project) in self.projects.iter().enumerate() {
+            if self.active_project_name.as_deref() == Some(project.name()) {
+                continue;
+            }
+
+            match &project.kind {
+                project::ProjectKind::Warm { workspaces, .. } => {
+                    for (slot, ws) in workspaces.iter().enumerate() {
+                        entries.push(ProjectOverviewEntry {
+                            slot,
+                            depth: self.project_fan_position(pidx, slot),
+                            name: project.name().to_string(),
+                            item: ProjectOverviewItem::Warm(ws),
+                        });
+                    }
+                }
+                project::ProjectKind::Dormant => {
+                    for slot in 0..project.config.workspaces.len() {
+                        entries.push(ProjectOverviewEntry {
+                            slot,
+                            depth: self.project_fan_position(pidx, slot),
+                            name: project.name().to_string(),
+                            item: ProjectOverviewItem::Placeholder,
+                        });
+                    }
+                }
+            }
+        }
+
+        mon.render_project_overview(ctx.r(), focus_ring, &entries, push, push_decor);
+    }
+
+    /// Cycle the project depth stack at the slot under the given point.
+    ///
+    /// Also moves the focused slot there, so subsequent keyboard/IPC cycling
+    /// continues from the same stack. Purely visual: never mutates projects.
+    pub fn project_overview_depth_cycle_at_point(
+        &mut self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+        closer: bool,
+    ) {
+        if !self.overview_open {
+            return;
+        }
+
+        let max_slot = (0..self.projects.len())
+            .map(|pidx| self.project_slot_count(pidx))
+            .max()
+            .unwrap_or(0);
+
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return;
+        };
+        let Some(mon) = monitors.iter_mut().find(|mon| mon.output == *output) else {
+            return;
+        };
+
+        let Some(slot) = mon.slot_index_at(pos_within_output, max_slot) else {
+            return;
+        };
+
+        if slot >= self.project_overview_depth.len() {
+            self.init_project_overview_depth();
+        }
+        self.project_overview_focused_slot = slot;
+
+        let len = self.projects_at_slot(slot).len();
+        if len > 0 && slot < self.project_overview_depth.len() {
+            self.project_overview_depth[slot] = if closer {
+                (self.project_overview_depth[slot] + 1) % len
+            } else {
+                (self.project_overview_depth[slot] + len - 1) % len
+            };
+        }
     }
 
     /// Search warm project workspaces for a window by wl_surface.
