@@ -4424,14 +4424,6 @@ impl Niri {
                 output,
                 focus_ring,
                 &mut |elem| (project_overview_push.borrow_mut())(elem.into()),
-                &mut |elem| match elem {
-                    crate::layout::ProjectOverviewDecorElement::SolidColor(elem) => {
-                        (project_overview_push.borrow_mut())(elem.into())
-                    }
-                    crate::layout::ProjectOverviewDecorElement::Texture(elem) => {
-                        (project_overview_push.borrow_mut())(elem.into())
-                    }
-                },
             );
 
             push_popups_from_layer!(Layer::Top);
@@ -4483,14 +4475,6 @@ impl Niri {
                 output,
                 focus_ring,
                 &mut |elem| (project_overview_push.borrow_mut())(elem.into()),
-                &mut |elem| match elem {
-                    crate::layout::ProjectOverviewDecorElement::SolidColor(elem) => {
-                        (project_overview_push.borrow_mut())(elem.into())
-                    }
-                    crate::layout::ProjectOverviewDecorElement::Texture(elem) => {
-                        (project_overview_push.borrow_mut())(elem.into())
-                    }
-                },
             );
 
             for (ws, geo) in mon.workspaces_with_render_geo() {

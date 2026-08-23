@@ -1,20 +1,14 @@
-use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::HashMap;
 use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
 
 use niri_config::{CornerRadius, LayoutPart};
-use pangocairo::cairo::{self, ImageSurface};
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
 use super::scrolling::{Column, ColumnWidth};
@@ -31,11 +25,9 @@ use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::RenderLayer;
 use crate::niri_render_elements;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
-use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::solid_color::SolidColorRenderElement;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
@@ -61,65 +53,6 @@ const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 const PROJECT_OVERVIEW_FAN_STEP_X: f64 = 26.;
 /// Vertical fan offset between stacked project overview cards, in screen pixels.
 const PROJECT_OVERVIEW_FAN_STEP_Y: f64 = 16.;
-/// Inset of the project name badge from the card corner, in screen pixels.
-const PROJECT_OVERVIEW_BADGE_INSET: f64 = 8.;
-/// Font used for the project name badges.
-const PROJECT_LABEL_FONT: &str = "sans-serif Bold 12";
-
-/// Render a project name into a texture for the overview badge.
-fn generate_project_label(
-    renderer: &mut GlesRenderer,
-    name: &str,
-    scale: f64,
-) -> anyhow::Result<TextureBuffer<GlesTexture>> {
-    let _span = tracy_client::span!("monitor::generate_project_label");
-
-    let font_size = 12. * scale;
-    let mut font = pango::FontDescription::from_string(PROJECT_LABEL_FONT);
-    font.set_absolute_size(font_size * pango::SCALE as f64);
-
-    // Measure.
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_single_paragraph_mode(true);
-    layout.set_font_description(Some(&font));
-    layout.set_text(name);
-
-    let (mut width, mut height) = layout.pixel_size();
-    if width <= 0 || height <= 0 {
-        anyhow::bail!("empty project label layout");
-    }
-    width = min(width, 16383);
-    height = min(height, 16383);
-
-    // Draw.
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_single_paragraph_mode(true);
-    layout.set_font_description(Some(&font));
-    layout.set_text(name);
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    drop(cr);
-    let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
-        Transform::Normal,
-        Vec::new(),
-    )?;
-
-    Ok(buffer)
-}
 
 #[derive(Debug)]
 pub struct Monitor<W: LayoutElement> {
@@ -156,8 +89,6 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
-    /// Cached project name label textures for the overview badges.
-    project_labels: RefCell<ProjectLabelCache>,
     /// Regular (non-project) workspaces saved aside while a project is active.
     ///
     /// While a project is active, this monitor holds ONLY the project's
@@ -280,16 +211,6 @@ niri_render_elements! {
 
 pub type MonitorRenderElement<R> =
     RelocateRenderElement<RescaleRenderElement<MonitorInnerRenderElement<R>>>;
-
-/// Cached project name label textures, keyed by (name, scale bits).
-type ProjectLabelCache = HashMap<(String, u64), Option<TextureBuffer<GlesTexture>>>;
-
-niri_render_elements! {
-    ProjectOverviewDecorElement => {
-        SolidColor = SolidColorRenderElement,
-        Texture = PrimaryGpuTextureRenderElement,
-    }
-}
 
 impl WorkspaceSwitch {
     pub fn current_idx(&self) -> f64 {
@@ -436,7 +357,6 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
-            project_labels: RefCell::new(HashMap::new()),
             saved_regular_workspaces: None,
             workspace_switch: None,
             clock,
@@ -1994,37 +1914,15 @@ impl<W: LayoutElement> Monitor<W> {
         (slot < max_slot).then_some(slot)
     }
 
-    /// Project name label texture for the overview badge, generated and cached.
-    fn project_label(
-        &self,
-        renderer: &mut GlesRenderer,
-        name: &str,
-        scale: f64,
-    ) -> Option<TextureBuffer<GlesTexture>> {
-        let key = (name.to_string(), scale.to_bits());
-        let mut cache = self.project_labels.borrow_mut();
-        cache
-            .entry(key)
-            .or_insert_with(|| {
-                generate_project_label(renderer, name, scale)
-                    .map_err(|err| warn!("failed to render project label {name:?}: {err:?}"))
-                    .ok()
-            })
-            .clone()
-    }
-
     /// Render the stacked project overview cards.
     ///
-    /// Card contents (warm workspaces) go through `push`; the decorative layer
-    /// (color rings, placeholder fills, name badges) goes through `push_decor`
-    /// and always renders above all card contents.
+    /// Card contents (warm workspaces) go through `push`.
     pub(super) fn render_project_overview<R>(
         &self,
         mut ctx: RenderCtx<R>,
         focus_ring: bool,
         entries: &[ProjectOverviewEntry<W>],
         push: &mut dyn FnMut(MonitorRenderElement<R>),
-        push_decor: &mut dyn FnMut(ProjectOverviewDecorElement),
     ) where
         R: NiriRenderer + crate::render_helpers::renderer::AsGlesRenderer,
     {
@@ -2060,9 +1958,6 @@ impl<W: LayoutElement> Monitor<W> {
             Size::from((i32::MAX, height)),
         );
 
-        // Decor is positioned in final screen space; these sizes are post-zoom.
-        let card_size: Size<f64, Logical> = ws_size.upscale(zoom);
-
         for entry in ordered {
             let y = first_ws_y + entry.slot as f64 * ws_height_with_gap;
             let base_loc: Point<f64, Logical> = Point::from((0., y)) + static_offset;
@@ -2073,8 +1968,6 @@ impl<W: LayoutElement> Monitor<W> {
             let base_phys: Point<i32, Physical> = base_loc.to_physical_precise_round(scale);
             let relocate_loc =
                 Point::<i32, Physical>::from((base_phys.x + fan_dx, base_phys.y + fan_dy));
-            let card_loc: Point<f64, Logical> =
-                Point::from((relocate_loc.x as f64 / scale, relocate_loc.y as f64 / scale));
 
             // ── Content ──────────────────────────────────────────────
             match &entry.item {
@@ -2116,49 +2009,6 @@ impl<W: LayoutElement> Monitor<W> {
                 }
                 ProjectOverviewItem::Placeholder => {}
             }
-
-            // ── Decor: name badge ────────────────────────────────────
-            let is_front = entry.depth == 0;
-            let (w, h) = (card_size.w, card_size.h);
-
-            // Name badge.
-            let gles = ctx.as_gles();
-            let Some(label) = self.project_label(gles.renderer, &entry.name, scale) else {
-                continue;
-            };
-            let label_size = label.logical_size();
-            let pad_x = PROJECT_OVERVIEW_BADGE_INSET;
-            let pad_y = 5.;
-            let pill_size = Size::new(label_size.w + 2. * pad_x, label_size.h + 2. * pad_y);
-            let pill_loc = if is_front || matches!(entry.item, ProjectOverviewItem::Placeholder) {
-                Point::from((
-                    card_loc.x + (w - pill_size.w) / 2.,
-                    card_loc.y + h - pill_size.h - PROJECT_OVERVIEW_BADGE_INSET,
-                ))
-            } else {
-                card_loc
-                    + Point::<f64, Logical>::from((
-                        PROJECT_OVERVIEW_BADGE_INSET,
-                        PROJECT_OVERVIEW_BADGE_INSET,
-                    ))
-            };
-
-            let pill_buffer = SolidColorBuffer::new(pill_size, [0.08, 0.08, 0.10, 0.90]);
-            push_decor(
-                SolidColorRenderElement::from_buffer(&pill_buffer, pill_loc, 1., Kind::Unspecified)
-                    .into(),
-            );
-            push_decor(
-                PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                    label.clone(),
-                    pill_loc + Point::<f64, Logical>::from((pad_x, pad_y)),
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                ))
-                .into(),
-            );
         }
     }
 

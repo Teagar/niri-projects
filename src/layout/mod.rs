@@ -53,7 +53,7 @@ use tile::{Tile, TileRenderElement};
 use workspace::{WorkspaceAddWindowTarget, WorkspaceId};
 
 use self::monitor::{Monitor, WorkspaceSwitch};
-pub use self::monitor::{MonitorRenderElement, ProjectOverviewDecorElement};
+pub use self::monitor::MonitorRenderElement;
 use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -603,8 +603,6 @@ pub(super) struct ProjectOverviewEntry<'a, W: LayoutElement> {
     pub slot: usize,
     /// Fan position: 0 is the front card, higher values fan out behind.
     pub depth: usize,
-    /// Project name for the label badge.
-    pub name: String,
     pub item: ProjectOverviewItem<'a, W>,
 }
 
@@ -5462,15 +5460,13 @@ impl<W: LayoutElement> Layout<W> {
     /// Render the stacked project overview cards for one output.
     ///
     /// The active project's workspaces are rendered by the regular overview
-    /// path; this renders every other project's cards fanned out per slot,
-    /// with dormant projects shown as solid placeholder cards.
+    /// path; this renders every other project's cards fanned out per slot.
     pub fn render_project_overview_for_output<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
         output: &Output,
         focus_ring: bool,
         push: &mut dyn FnMut(MonitorRenderElement<R>),
-        push_decor: &mut dyn FnMut(ProjectOverviewDecorElement),
     ) {
         if !self.overview_open {
             return;
@@ -5496,7 +5492,6 @@ impl<W: LayoutElement> Layout<W> {
                         entries.push(ProjectOverviewEntry {
                             slot,
                             depth: self.project_fan_position(pidx, slot),
-                            name: project.name().to_string(),
                             item: ProjectOverviewItem::Warm(ws),
                         });
                     }
@@ -5506,7 +5501,6 @@ impl<W: LayoutElement> Layout<W> {
                         entries.push(ProjectOverviewEntry {
                             slot,
                             depth: self.project_fan_position(pidx, slot),
-                            name: project.name().to_string(),
                             item: ProjectOverviewItem::Placeholder,
                         });
                     }
@@ -5514,7 +5508,7 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        mon.render_project_overview(ctx.r(), focus_ring, &entries, push, push_decor);
+        mon.render_project_overview(ctx.r(), focus_ring, &entries, push);
     }
 
     /// Cycle the project depth stack at the slot under the given point.
