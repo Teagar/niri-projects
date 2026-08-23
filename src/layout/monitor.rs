@@ -2117,17 +2117,9 @@ impl<W: LayoutElement> Monitor<W> {
                 ProjectOverviewItem::Placeholder => {}
             }
 
-            // ── Decor: placeholder fill + name badge ────────────────
+            // ── Decor: name badge ────────────────────────────────────
             let is_front = entry.depth == 0;
             let (w, h) = (card_size.w, card_size.h);
-
-            if matches!(entry.item, ProjectOverviewItem::Placeholder) {
-                let buffer = SolidColorBuffer::new(card_size, [0.04, 0.04, 0.06, 0.96]);
-                push_decor(
-                    SolidColorRenderElement::from_buffer(&buffer, card_loc, 1., Kind::Unspecified)
-                        .into(),
-                );
-            }
 
             // Name badge.
             let gles = ctx.as_gles();
