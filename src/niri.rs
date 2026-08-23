@@ -4443,7 +4443,9 @@ impl Niri {
 
             // We don't expect more than one workspace when render_above_top_layer().
             if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
-                push(ws.render_background().into());
+                if !self.layout.is_overview_open() {
+                    push(ws.render_background().into());
+                }
             }
         } else {
             push_popups_from_layer!(Layer::Top);
@@ -4504,7 +4506,9 @@ impl Niri {
                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
-                process!(geo)(ws.render_background());
+                if !self.layout.is_overview_open() {
+                    process!(geo)(ws.render_background());
+                }
             }
         }
 
