@@ -9,6 +9,8 @@
 
 use super::*;
 
+use crate::layout::monitor::{DRAWER_MAX_VISIBLE_DEPTH, DRAWER_TAB_HEIGHT};
+
 fn make_project_config(name: &str) -> niri_config::ProjectConfig {
     niri_config::ProjectConfig {
         name: name.to_string(),
@@ -514,4 +516,115 @@ fn windows_created_in_a_project_stay_in_that_project() {
     layout.switch_to_project("project_a");
     assert_eq!(monitor_windows(&layout), vec![42]);
     assert!(layout.has_window(&43), "window 43 must survive parking");
+}
+
+// ── Drawer geometry regression tests ────────────────────────────────────────
+//
+// These guard against the "cards drawn off-screen" failure mode where card
+// rectangles extended far past the output bounds (only a single corner was
+// ever visible) due to double-offset positioning of drawer elements.
+
+/// Every drawer card (including its folder tab above it) must stay within the
+/// output's logical bounds for all visible depths and common scales.
+#[test]
+fn drawer_card_bounds_stay_within_output() {
+    let mut layout = setup_layout_with_projects();
+    // Two extra projects so the maximum visible depth (3) is exercised.
+    layout.ensure_project(&make_project_config("project_c"));
+    layout.ensure_project(&make_project_config("project_d"));
+    layout.toggle_project_overview();
+
+    let output = layout.outputs().next().unwrap().clone();
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let scale = mon.scale().fractional_scale();
+    let view = Size::<f64, Logical>::from((1280., 720.));
+
+    for stack_pos in 0..=DRAWER_MAX_VISIBLE_DEPTH as usize {
+        let rect = mon.project_drawer_card_layout(scale, stack_pos as f64);
+
+        assert!(
+            rect.loc.x >= 0.,
+            "card {stack_pos} extends past the left edge: {rect:?}"
+        );
+        assert!(
+            rect.loc.y - DRAWER_TAB_HEIGHT >= -0.5,
+            "card {stack_pos} tab extends past the top edge: {rect:?}"
+        );
+        assert!(
+            rect.loc.x + rect.size.w <= view.w + 0.5,
+            "card {stack_pos} extends past the right edge: {rect:?}"
+        );
+        assert!(
+            rect.loc.y + rect.size.h <= view.h + 0.5,
+            "card {stack_pos} extends past the bottom edge: {rect:?}"
+        );
+
+        // A point in each card's exposed strip (the part not covered by the
+        // card in front of it) must hit-test back to that card.
+        let prev_bottom = if stack_pos == 0 {
+            rect.loc.y
+        } else {
+            let prev =
+                mon.project_drawer_card_layout(scale, (stack_pos - 1) as f64);
+            prev.loc.y + prev.size.h
+        };
+        let probe = Point::from((
+            rect.loc.x + rect.size.w / 2.,
+            (prev_bottom + rect.loc.y + rect.size.h) / 2.,
+        ));
+        let hit = mon.project_drawer_hit_test(probe, 4);
+        assert_eq!(
+            hit,
+            Some(stack_pos),
+            "exposed strip of card {stack_pos} must hit-test to itself"
+        );
+    }
+}
+
+/// Stacked cards must remain centered on the front card's horizontal axis
+/// (they shrink toward the middle, not toward their top-left corner).
+#[test]
+fn drawer_stacked_cards_stay_centered() {
+    let layout = setup_layout_with_projects();
+
+    let output = layout.outputs().next().unwrap().clone();
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let scale = mon.scale().fractional_scale();
+
+    let front = mon.project_drawer_card_layout(scale, 0.);
+    let back = mon.project_drawer_card_layout(scale, 1.);
+
+    let front_cx = front.loc.x + front.size.w / 2.;
+    let back_cx = back.loc.x + back.size.w / 2.;
+    assert!(
+        (front_cx - back_cx).abs() < 0.5,
+        "stacked cards drifted off-center: front cx {front_cx}, back cx {back_cx}"
+    );
+
+    // Deeper cards are strictly smaller and strictly lower than the front.
+    assert!(back.size.w < front.size.w);
+    assert!(back.loc.y > front.loc.y);
+}
+
+/// Fractional depths (mid-animation) must produce in-bounds cards too.
+#[test]
+fn drawer_mid_animation_depths_stay_in_bounds() {
+    let layout = setup_layout_with_projects();
+
+    let output = layout.outputs().next().unwrap().clone();
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let scale = mon.scale().fractional_scale();
+    let view = Size::<f64, Logical>::from((1280., 720.));
+
+    let mut depth = -0.4;
+    while depth <= DRAWER_MAX_VISIBLE_DEPTH + 0.4 {
+        let rect = mon.project_drawer_card_layout(scale, depth);
+        assert!(rect.loc.x >= 0. && rect.loc.y >= -DRAWER_TAB_HEIGHT - 0.5);
+        assert!(
+            rect.loc.x + rect.size.w <= view.w + 0.5
+                && rect.loc.y + rect.size.h <= view.h + 0.5,
+            "depth {depth} produced an out-of-bounds card: {rect:?}"
+        );
+        depth += 0.1;
+    }
 }

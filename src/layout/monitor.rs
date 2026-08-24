@@ -63,19 +63,23 @@ const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 const DRAWER_CARD_WIDTH_FRAC: f64 = 0.62;
 /// Vertical center of the card block, as a fraction of the view height.
 const DRAWER_CARD_CENTER_Y_FRAC: f64 = 0.52;
-/// Downward offset per depth step behind the front card.
-const DRAWER_STEP_Y: f64 = 26.;
+/// Downward offset per depth step behind the front card, as a fraction of
+/// the card height.
+///
+/// Must exceed the per-step height shrink (`DRAWER_SCALE_STEP`) or deeper
+/// cards are completely hidden behind the front one.
+pub(super) const DRAWER_STEP_Y_FRAC: f64 = 0.08;
 /// Scale reduction per depth step.
 const DRAWER_SCALE_STEP: f64 = 0.06;
 /// Darkening overlay alpha added per depth step.
 const DRAWER_DIM_STEP: f64 = 0.16;
 /// Maximum visible depth steps behind the front card.
-const DRAWER_MAX_VISIBLE_DEPTH: f64 = 3.;
+pub(super) const DRAWER_MAX_VISIBLE_DEPTH: f64 = 3.;
 /// Card corner radius and border width.
 const DRAWER_CARD_RADIUS: f64 = 14.;
 const DRAWER_BORDER_WIDTH: f64 = 2.;
 /// Folder tab geometry.
-const DRAWER_TAB_HEIGHT: f64 = 30.;
+pub(super) const DRAWER_TAB_HEIGHT: f64 = 30.;
 const DRAWER_TAB_RADIUS: f64 = 10.;
 const DRAWER_TAB_INSET_X: f64 = 22.;
 const DRAWER_TAB_STAGGER_X: f64 = 46.;
@@ -87,6 +91,41 @@ const DRAWER_PLACEHOLDER_COLOR: [f32; 4] = [0.071, 0.082, 0.11, 1.];
 const DRAWER_TAB_TEXT_COLOR: [f64; 4] = [0.02, 0.027, 0.039, 1.];
 /// Duration of the drawer glide animations, in ms.
 const DRAWER_ANIM_MS: u64 = 320;
+// ── Drawer navigation chrome (arrows / dots / hint) ─────────────────────────
+
+/// Distance of the prev/next chevrons from the view edges.
+const DRAWER_ARROW_MARGIN_X: f64 = 42.;
+/// Chevron size (square bounding box), in logical px.
+const DRAWER_ARROW_SIZE: f64 = 34.;
+/// Chevron stroke width, in logical px.
+const DRAWER_ARROW_STROKE: f64 = 3.;
+/// Chevron color (light on dark backdrop).
+const DRAWER_ARROW_COLOR: [f64; 4] = [0.85, 0.87, 0.92, 0.65];
+/// Vertical position of the dot indicators, as a fraction of the view height.
+const DRAWER_DOTS_Y_FRAC: f64 = 0.9;
+/// Dot diameter, in logical px.
+const DRAWER_DOT_DIAMETER: f64 = 8.;
+/// Gap between dots, in logical px.
+const DRAWER_DOT_GAP: f64 = 14.;
+/// Inactive dot color.
+const DRAWER_DOT_INACTIVE: [f64; 4] = [1., 1., 1., 0.25];
+/// Hint text font size, in logical px.
+const DRAWER_HINT_FONT_SIZE: f64 = 11.;
+/// Hint text color.
+const DRAWER_HINT_COLOR: [f64; 4] = [0.75, 0.78, 0.84, 0.55];
+/// Hint text shown under the dots.
+pub const DRAWER_HINT_TEXT: &str = "←→ select · enter confirm · esc close";
+
+/// Cache key for drawer chrome textures (tag, aux1, aux2, scale bits).
+type ChromeCache = HashMap<(u8, u64, u64, u64), TextureBuffer<GlesTexture>>;
+
+/// Chrome texture kinds for [`ChromeCache`] keys.
+mod chrome_kind {
+    pub const CHEVRON_LEFT: u8 = 0;
+    pub const CHEVRON_RIGHT: u8 = 1;
+    pub const DOTS: u8 = 2;
+    pub const HINT: u8 = 3;
+}
 
 /// Cache key and value for folder tab textures.
 type TabCache = HashMap<(String, &'static str, u32, u64), TextureBuffer<GlesTexture>>;
@@ -135,6 +174,8 @@ pub struct Monitor<W: LayoutElement> {
     /// Cached rounded border overlay textures, keyed by
     /// (color bits, width px, height px).
     project_border_cache: RefCell<HashMap<(u64, i32, i32), TextureBuffer<GlesTexture>>>,
+    /// Cached drawer chrome textures (chevrons / dots / hint).
+    project_chrome_cache: RefCell<ChromeCache>,
     /// Regular (non-project) workspaces saved aside while a project is active.
     ///
     /// While a project is active, this monitor holds ONLY the project's
@@ -408,6 +449,7 @@ impl<W: LayoutElement> Monitor<W> {
             project_drawer_anims: HashMap::new(),
             project_tab_cache: RefCell::new(HashMap::new()),
             project_border_cache: RefCell::new(HashMap::new()),
+            project_chrome_cache: RefCell::new(HashMap::new()),
             saved_regular_workspaces: None,
             workspace_switch: None,
             clock,
@@ -2011,12 +2053,36 @@ impl<W: LayoutElement> Monitor<W> {
 
         let pose = move |depth: f64| -> (i32, f64) {
             let d = depth.clamp(0., DRAWER_MAX_VISIBLE_DEPTH);
-            let dy = DRAWER_STEP_Y * d * scale;
+            let dy = DRAWER_STEP_Y_FRAC * card_h * d * scale;
             let size_factor = 1. - DRAWER_SCALE_STEP * d;
             (dy.round() as i32, size_factor)
         };
 
         (card_rect, pose)
+    }
+
+    /// Final on-screen layout of the card at the given depth.
+    ///
+    /// Single source of truth for drawer geometry: used by rendering,
+    /// hit-testing and the geometry regression tests so they cannot drift
+    /// apart. Returns the card rectangle in logical output coordinates with
+    /// the depth offsets already folded in; stacked cards stay centered on
+    /// the front card's horizontal axis.
+    pub(super) fn project_drawer_card_layout(
+        &self,
+        scale: f64,
+        depth: f64,
+    ) -> Rectangle<f64, Logical> {
+        let (rect, pose) = self.project_drawer_geometry(scale);
+        let d = depth.clamp(0., DRAWER_MAX_VISIBLE_DEPTH);
+        let (dy_phys, size_factor) = pose(d);
+
+        // Scaled size, centered on the front card's horizontal axis.
+        let w = rect.size.w * size_factor;
+        let h = rect.size.h * size_factor;
+        let x = rect.loc.x + (rect.size.w - w) / 2.;
+        let y = rect.loc.y + dy_phys as f64 / scale;
+        Rectangle::new(Point::from((x, y)), Size::from((w, h)))
     }
 
     /// Drawer card under the given point, front-most first.
@@ -2028,16 +2094,11 @@ impl<W: LayoutElement> Monitor<W> {
         len: usize,
     ) -> Option<usize> {
         let scale = self.scale.fractional_scale();
-        let (rect, pose) = self.project_drawer_geometry(scale);
 
         let max_visible = (len as f64).min(DRAWER_MAX_VISIBLE_DEPTH + 1.) as usize;
         for stack_pos in 0..max_visible {
-            let (dy, size_factor) = pose(stack_pos as f64);
-            let hit_rect = Rectangle::new(
-                Point::from((rect.loc.x, rect.loc.y + dy as f64 / scale)),
-                Size::from((rect.size.w * size_factor, rect.size.h * size_factor)),
-            );
-            if hit_rect.contains(pos_within_output) {
+            let layout = self.project_drawer_card_layout(scale, stack_pos as f64);
+            if layout.contains(pos_within_output) {
                 return Some(stack_pos);
             }
         }
@@ -2129,18 +2190,32 @@ impl<W: LayoutElement> Monitor<W> {
 
         // NOTE: smithay renders pushed elements in REVERSE order — the first
         // pushed element ends up on top. So within the frame we push:
-        //   per card (front to back): dim, tab, border, content
-        // and the backdrop LAST so it lands at the bottom of the stack.
+        //   1. navigation chrome (arrows / dots / hint) — topmost
+        //   2. per card (front to back): dim, tab, border, content
+        //   3. the backdrop LAST so it lands at the bottom of the stack.
+        //
+        // Texture elements are positioned ONLY via their `from_texture_buffer`
+        // location (logical coords). They must NOT additionally be wrapped in
+        // a Relocate element, or they end up double-offset off-screen.
 
-        let (card_rect, pose) = self.project_drawer_geometry(scale);
-        let card_base_loc = card_rect.loc.to_physical_precise_round(scale);
+        // ── Navigation chrome (topmost) ──────────────────────────────
+        {
+            let gles = ctx.as_gles();
+            self.render_project_drawer_chrome(gles.renderer, entries, &mut |elem| {
+                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                push(RelocateRenderElement::from_element(
+                    elem,
+                    Point::from((0, 0)),
+                    Relocate::Relative,
+                ));
+            });
+        }
 
         // Front card first so it lands on top.
         let mut ordered: Vec<&ProjectOverviewEntry<W>> = entries.iter().collect();
         ordered.sort_by(|a, b| a.depth.total_cmp(&b.depth));
 
-        for entry in ordered {
-            // Animated depth if gliding, static target otherwise.
+        for entry in ordered {            // Animated depth if gliding, static target otherwise.
             let depth = match self.project_drawer_anims.get(&entry.idx) {
                 Some(anim) => anim.clamped_value(),
                 None => entry.depth,
@@ -2149,14 +2224,14 @@ impl<W: LayoutElement> Monitor<W> {
                 continue;
             }
 
-            let (dy_phys, size_factor) = pose(depth.max(0.));
             let dim_alpha = (DRAWER_DIM_STEP * depth.max(0.)).min(0.6);
 
-            // Card content region (physical px).
-            let card_w_px = ((card_rect.size.w * size_factor) * scale).round() as i32;
-            let card_h_px = ((card_rect.size.h * size_factor) * scale).round() as i32;
-            let content_loc =
-                Point::<i32, Physical>::from((card_base_loc.x, card_base_loc.y + dy_phys));
+            // Card region (physical px), centered per depth via the shared
+            // geometry helper.
+            let card_layout = self.project_drawer_card_layout(scale, depth.max(0.));
+            let card_w_px = ((card_layout.size.w * scale).round() as i32).max(1);
+            let card_h_px = ((card_layout.size.h * scale).round() as i32).max(1);
+            let content_loc = card_layout.loc.to_physical_precise_round(scale);
             let tab_h_phys = (DRAWER_TAB_HEIGHT * scale).round() as i32;
 
             let gles = ctx.as_gles();
@@ -2194,18 +2269,16 @@ impl<W: LayoutElement> Monitor<W> {
                 scale,
             );
             let tab_size = tab.logical_size();
-            let max_stagger = (card_rect.size.w - tab_size.w).max(0.);
+            let max_stagger =
+                (card_layout.size.w - DRAWER_TAB_INSET_X - tab_size.w).max(0.);
             let stagger = ((DRAWER_TAB_INSET_X
-                + DRAWER_TAB_STAGGER_X * entry.idx as f64)
+                + DRAWER_TAB_STAGGER_X * (entry.idx % 8) as f64)
             .min(max_stagger))
             .round();
-            let tab_loc = Point::<i32, Physical>::from((
-                card_base_loc.x + (stagger * scale).round() as i32,
-                content_loc.y - tab_h_phys,
-            ));
+            // Position ONLY via the from_texture_buffer location.
             let tab_logical = Point::from((
-                tab_loc.x as f64 / scale,
-                tab_loc.y as f64 / scale,
+                content_loc.x as f64 / scale + stagger,
+                (content_loc.y - tab_h_phys) as f64 / scale,
             ));
             let elem = MonitorInnerRenderElement::Texture(PrimaryGpuTextureRenderElement(
                 TextureRenderElement::from_texture_buffer(
@@ -2218,21 +2291,22 @@ impl<W: LayoutElement> Monitor<W> {
                 ),
             ));
             let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-            let elem = RelocateRenderElement::from_element(elem, tab_loc, Relocate::Relative);
-            push(elem);
+            push(RelocateRenderElement::from_element(
+                elem,
+                Point::from((0, 0)),
+                Relocate::Relative,
+            ));
 
             // ── Border overlay ───────────────────────────────────────
             let border = self.project_border(
                 gles.renderer,
                 entry.color,
-                card_w_px.max(1),
-                card_h_px.max(1),
+                card_w_px,
+                card_h_px,
                 scale,
             );
-            let border_logical = Point::from((
-                content_loc.x as f64 / scale,
-                content_loc.y as f64 / scale,
-            ));
+            let border_logical =
+                Point::from((content_loc.x as f64 / scale, content_loc.y as f64 / scale));
             let elem = MonitorInnerRenderElement::Texture(PrimaryGpuTextureRenderElement(
                 TextureRenderElement::from_texture_buffer(
                     border,
@@ -2244,21 +2318,23 @@ impl<W: LayoutElement> Monitor<W> {
                 ),
             ));
             let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-            let elem =
-                RelocateRenderElement::from_element(elem, content_loc, Relocate::Relative);
-            push(elem);
+            push(RelocateRenderElement::from_element(
+                elem,
+                Point::from((0, 0)),
+                Relocate::Relative,
+            ));
 
             // ── Content (bottom-most within this card) ───────────────
             match &entry.item {
                 ProjectOverviewItem::Warm(ws) => {
                     // Fit the workspace render into the card.
-                    let fit_factor =
-                        card_rect.size.w * size_factor / self.view_size.w * zoom;
+                    let fit_factor = card_layout.size.w / self.view_size.w * zoom;
                     let crop_bounds = Rectangle::new(
                         Point::from((-i32::MAX / 2, 0)),
                         Size::from((i32::MAX, i32::MAX)),
                     );
-                    let xray_pos = XrayPos::new(card_rect.loc, zoom);
+                    let xray_pos =
+                        XrayPos::new(card_layout.loc.to_f64(), zoom);
 
                     let mut push_card = |elem: WorkspaceRenderElement<R>| {
                         if let Some(cropped) =
@@ -2330,6 +2406,163 @@ impl<W: LayoutElement> Monitor<W> {
         let elem = RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
         push(elem);
     }
+
+    /// Navigation chrome for the drawer: prev/next chevrons, one dot per
+    /// project (selected highlighted) and a keybinding hint line.
+    ///
+    /// Pushed before the cards so it lands above everything.
+    fn render_project_drawer_chrome<R2: NiriRenderer>(
+        &self,
+        renderer: &mut GlesRenderer,
+        entries: &[ProjectOverviewEntry<W>],
+        push: &mut dyn FnMut(MonitorInnerRenderElement<R2>),
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+
+        let scale = self.scale.fractional_scale();
+        let view = self.view_size;
+
+        let mut push_tex = |tex: TextureBuffer<GlesTexture>, loc: Point<f64, Logical>| {
+            let elem = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+                tex, loc, 1., None, None, Kind::Unspecified,
+            ));
+            push(MonitorInnerRenderElement::Texture(elem));
+        };
+
+        // Front-most entry is the selected one.
+        let selected = entries.iter().min_by(|a, b| a.depth.total_cmp(&b.depth));
+        let selected_idx = selected.map(|e| e.idx).unwrap_or(0);
+
+        // ── Prev / next chevrons flanking the card stack ─────────────
+        let arrow_y =
+            view.h * DRAWER_CARD_CENTER_Y_FRAC - DRAWER_ARROW_SIZE / 2.;
+        for (right, x) in [
+            (
+                false,
+                DRAWER_ARROW_MARGIN_X,
+            ),
+            (
+                true,
+                view.w - DRAWER_ARROW_MARGIN_X - DRAWER_ARROW_SIZE,
+            ),
+        ] {
+            let tex = self.chrome_chevron(renderer, right, scale);
+            push_tex(tex, Point::from((x, arrow_y)));
+        }
+
+        // ── One dot per project, config order, selected highlighted ──
+        let colors: Vec<[f32; 4]> =
+            entries.iter().map(|e| e.color).collect();
+        let dots = self.chrome_dots(renderer, &colors, selected_idx, scale);
+        let dots_size = dots.logical_size();
+        let dots_x = (view.w - dots_size.w) / 2.;
+        let dots_y = view.h * DRAWER_DOTS_Y_FRAC - dots_size.h / 2.;
+        push_tex(dots, Point::from((dots_x, dots_y)));
+
+        // ── Keybinding hint under the dots ───────────────────────────
+        let hint = self.chrome_hint(renderer, scale);
+        let hint_size = hint.logical_size();
+        let hint_x = (view.w - hint_size.w) / 2.;
+        let hint_y = (dots_y + dots_size.h + 12.)
+            .min(view.h - hint_size.h - 2.);
+        push_tex(hint, Point::from((hint_x, hint_y)));
+    }
+
+    /// Cached left/right chevron texture.
+    fn chrome_chevron(
+        &self,
+        renderer: &mut GlesRenderer,
+        points_right: bool,
+        scale: f64,
+    ) -> TextureBuffer<GlesTexture> {
+        let key = (
+            if points_right {
+                chrome_kind::CHEVRON_RIGHT
+            } else {
+                chrome_kind::CHEVRON_LEFT
+            },
+            0,
+            0,
+            scale.to_bits(),
+        );
+        let mut cache = self.project_chrome_cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                generate_chevron(
+                    renderer,
+                    points_right,
+                    (DRAWER_ARROW_SIZE * scale).round() as i32,
+                    DRAWER_ARROW_COLOR,
+                    DRAWER_ARROW_STROKE * scale,
+                )
+                .unwrap_or_else(|err| {
+                    warn!("failed to render drawer chevron: {err:?}");
+                    panic!("chevron generation failed")
+                })
+            })
+            .clone()
+    }
+
+    /// Cached dot-indicator strip texture.
+    fn chrome_dots(
+        &self,
+        renderer: &mut GlesRenderer,
+        colors: &[[f32; 4]],
+        selected: usize,
+        scale: f64,
+    ) -> TextureBuffer<GlesTexture> {
+        let colors_hash = colors.iter().fold(0u64, |acc, c| {
+            acc.wrapping_mul(31).wrapping_add(c.iter().fold(0u64, |a, v| {
+                a.wrapping_mul(31).wrapping_add((*v as f64 * 255.).round() as u64)
+            }))
+        });
+        let key = (
+            chrome_kind::DOTS,
+            colors.len() as u64,
+            selected as u64,
+            colors_hash ^ scale.to_bits(),
+        );
+        let mut cache = self.project_chrome_cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                generate_dots_strip(renderer, colors, selected, scale)
+                    .unwrap_or_else(|err| {
+                        warn!("failed to render drawer dots: {err:?}");
+                        panic!("dots generation failed")
+                    })
+            })
+            .clone()
+    }
+
+    /// Cached keybinding hint text texture.
+    fn chrome_hint(
+        &self,
+        renderer: &mut GlesRenderer,
+        scale: f64,
+    ) -> TextureBuffer<GlesTexture> {
+        let key = (
+            chrome_kind::HINT,
+            0,
+            0,
+            scale.to_bits(),
+        );
+        let mut cache = self.project_chrome_cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                generate_hint_text(renderer, DRAWER_HINT_TEXT, scale)
+                    .unwrap_or_else(|err| {
+                        warn!("failed to render drawer hint: {err:?}");
+                        panic!("hint generation failed")
+                    })
+            })
+            .clone()
+    }
+
 
     pub fn render_workspace_shadows<R: NiriRenderer>(
         &self,
@@ -2968,4 +3201,159 @@ fn pangocairo_draw_text(
     cr.move_to(x, y);
     pangocairo::functions::show_layout(cr, &layout);
     let _ = cr.restore();
+}
+
+/// Render a chevron (prev/next arrow) into a texture.
+fn generate_chevron(
+    renderer: &mut GlesRenderer,
+    points_right: bool,
+    size_px: i32,
+    color: [f64; 4],
+    stroke_w: f64,
+) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+    let _span = tracy_client::span!("monitor::generate_chevron");
+
+    let size = size_px.clamp(1, 1024);
+    let scale = size as f64 / DRAWER_ARROW_SIZE.max(1.);
+
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, size, size)?;
+    let cr = cairo::Context::new(&surface)?;
+
+    let m = stroke_w.max(2.) + stroke_w / 2.;
+    let h = size as f64;
+    if points_right {
+        // Draw a mirrored (left-pointing) base chevron flipped horizontally.
+        cr.set_matrix(cairo::Matrix::new(-1., 0., 0., 1., h, 0.));
+    }
+    cr.move_to(m, m);
+    cr.line_to(h - m, h / 2.);
+    cr.line_to(m, h - m);
+    cr.set_line_width(stroke_w);
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.set_line_join(cairo::LineJoin::Round);
+    cr.set_source_rgba(color[0], color[1], color[2], color[3]);
+    let _ = cr.stroke();
+
+    drop(cr);
+    let data = surface.take_data().unwrap();
+    let buffer = TextureBuffer::from_memory(
+        renderer,
+        &data,
+        Fourcc::Argb8888,
+        (size, size),
+        false,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    )?;
+
+    Ok(buffer)
+}
+
+/// Render the dot-indicator strip for the drawer chrome.
+fn generate_dots_strip(
+    renderer: &mut GlesRenderer,
+    colors: &[[f32; 4]],
+    selected: usize,
+    scale: f64,
+) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+    let _span = tracy_client::span!("monitor::generate_dots_strip");
+    if colors.is_empty() {
+        anyhow::bail!("no dots to render");
+    }
+
+    let d = ((DRAWER_DOT_DIAMETER * scale).round() as i32).max(1);
+    let gap = ((DRAWER_DOT_GAP * scale).round() as i32).max(0);
+    let width = colors.len() as i32 * d + (colors.len() as i32 - 1) * gap;
+    let height = d;
+
+    let surface = cairo::ImageSurface::create(
+        cairo::Format::ARgb32,
+        width.min(16383),
+        height.min(16383),
+    )?;
+    let cr = cairo::Context::new(&surface)?;
+
+    for (i, color) in colors.iter().enumerate() {
+        let cx = i as f64 * (d + gap) as f64 + d as f64 / 2.;
+        let cy = height as f64 / 2.;
+        if i == selected {
+            cr.arc(cx, cy, d as f64 / 2., 0., 2. * std::f64::consts::PI);
+            cr.set_source_rgba(
+                color[0] as f64,
+                color[1] as f64,
+                color[2] as f64,
+                1.,
+            );
+        } else {
+            cr.arc(cx, cy, d as f64 * 0.35, 0., 2. * std::f64::consts::PI);
+            cr.set_source_rgba(
+                DRAWER_DOT_INACTIVE[0],
+                DRAWER_DOT_INACTIVE[1],
+                DRAWER_DOT_INACTIVE[2],
+                DRAWER_DOT_INACTIVE[3],
+            );
+        }
+        let _ = cr.fill();
+    }
+
+    drop(cr);
+    let data = surface.take_data().unwrap();
+    let buffer = TextureBuffer::from_memory(
+        renderer,
+        &data,
+        Fourcc::Argb8888,
+        (width, height),
+        false,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    )?;
+
+    Ok(buffer)
+}
+
+/// Render the keybinding hint line for the drawer chrome.
+fn generate_hint_text(
+    renderer: &mut GlesRenderer,
+    text: &str,
+    scale: f64,
+) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+    let _span = tracy_client::span!("monitor::generate_hint_text");
+
+    let mut font = pango::FontDescription::from_string("sans-serif");
+    font.set_absolute_size(scale * DRAWER_HINT_FONT_SIZE * pango::SCALE as f64);
+
+    let (text_w, text_h) = measure_text(text, &font);
+    let width = (text_w + 2).min(16383);
+    let height = (text_h + 2).min(16383);
+    if width <= 0 || height <= 0 {
+        anyhow::bail!("empty hint text");
+    }
+
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+    let cr = cairo::Context::new(&surface)?;
+    pangocairo_draw_text(
+        &cr,
+        &font,
+        DRAWER_HINT_COLOR,
+        DRAWER_HINT_COLOR[3],
+        1.,
+        1.,
+    );
+
+    drop(cr);
+    let data = surface.take_data().unwrap();
+    let buffer = TextureBuffer::from_memory(
+        renderer,
+        &data,
+        Fourcc::Argb8888,
+        (width, height),
+        false,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    )?;
+
+    Ok(buffer)
 }
