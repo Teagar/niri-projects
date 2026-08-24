@@ -9,7 +9,8 @@
 
 use super::*;
 
-use crate::layout::monitor::{DRAWER_MAX_VISIBLE_DEPTH, DRAWER_TAB_HEIGHT};
+use crate::layout::monitor::{tab_shape_path, DRAWER_MAX_VISIBLE_DEPTH, DRAWER_TAB_HEIGHT};
+use pangocairo::cairo;
 
 fn make_project_config(name: &str) -> niri_config::ProjectConfig {
     niri_config::ProjectConfig {
@@ -627,4 +628,105 @@ fn drawer_mid_animation_depths_stay_in_bounds() {
         );
         depth += 0.1;
     }
+}
+
+/// Regression: the folder tab path must produce a solid rounded-TOP
+/// rectangle (square bottom corners), not a degenerate wedge. Guards
+/// against arc-center mistakes in the cairo path construction.
+#[test]
+fn project_tab_shape_is_solid_rounded_rectangle() {
+    let (w, h) = (200i32, 30i32);
+    let radius = 10f64;
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+    {
+        let cr = cairo::Context::new(&surface).unwrap();
+        tab_shape_path(&cr, w as f64, h as f64, radius);
+        cr.set_source_rgb(1., 1., 1.);
+        let _ = cr.fill();
+    }
+    surface.flush();
+    let stride = surface.stride() as usize;
+    let data = surface.data().unwrap();
+    // ARgb32 is native-endian; alpha is the 4th byte of each pixel.
+    let alpha = |x: i32, y: i32| data[y as usize * stride + x as usize * 4 + 3];
+    // Bottom row: fully opaque across the full width (square corners).
+    for x in 0..w {
+        assert_eq!(
+            alpha(x, h - 1),
+            255,
+            "bottom row must be solid at x={x} — the tab is not a rectangle"
+        );
+    }
+
+    // Top row: opaque only between the rounded corners.
+    for x in 0..w {
+        let a = alpha(x, 0);
+        if (x as f64) >= radius && x < w - radius as i32 {
+            assert_eq!(a, 255, "top edge missing at x={x}");
+        } else {
+            assert!(a < 250, "top corner must be rounded at x={x}");
+        }
+    }
+
+    // Nothing outside the shape.
+    assert_eq!(alpha(0, 0), 0);
+}
+
+/// Regression: the ACTIVE project's card must carry its live workspace
+/// (rendered as a thumbnail), not a placeholder fill. The workspaces of the
+/// active project live on the monitor, not in the Warm store.
+#[test]
+fn active_project_card_carries_live_workspace() {
+    use crate::layout::{ProjectOverviewItem};
+
+    let mut layout = setup_layout_with_projects();
+    layout.switch_to_project("project_a");
+
+    let win = TestWindow::new(TestWindowParams::new(7));
+    layout.add_window(
+        win,
+        AddWindowTarget::Auto,
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::default(),
+    );
+
+    layout.toggle_project_overview();
+    let entries = layout.project_overview_entries();
+
+    let active = entries
+        .iter()
+        .find(|e| e.name == "project_a")
+        .expect("project_a entry");
+    assert_eq!(active.state_label, "active");
+    assert!(
+        matches!(active.item, ProjectOverviewItem::Warm(_)),
+        "active project card must reference its live workspace"
+    );
+
+    // project_b is dormant here: placeholder card.
+    let dormant = entries
+        .iter()
+        .find(|e| e.name == "project_b")
+        .expect("project_b entry");
+    assert!(
+        matches!(dormant.item, ProjectOverviewItem::Placeholder),
+        "dormant project card must be a placeholder"
+    );
+
+    // After switching away, project_a becomes warm and still carries a real
+    // workspace (parked).
+    layout.switch_to_project("project_b");
+    let entries = layout.project_overview_entries();
+    let warm = entries
+        .iter()
+        .find(|e| e.name == "project_a")
+        .expect("project_a entry");
+    assert_eq!(warm.state_label, "warm");
+    assert!(
+        matches!(warm.item, ProjectOverviewItem::Warm(_)),
+        "warm parked project card must carry its workspace thumbnail source"
+    );
 }

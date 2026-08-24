@@ -5513,19 +5513,40 @@ impl<W: LayoutElement> Layout<W> {
                 None => project.color(),
             };
 
-            let (item, state_label) = match &project.kind {
-                project::ProjectKind::Warm { workspaces, active_workspace_idx, .. } => {
-                    let ws = workspaces
-                        .get(*active_workspace_idx)
-                        .or_else(|| workspaces.first());
-                    match ws {
-                        Some(ws) => (ProjectOverviewItem::Warm(ws), "warm"),
-                        None => (ProjectOverviewItem::Placeholder, "warm"),
+            // While a project is ACTIVE its workspaces live on the active
+            // monitor (take_workspaces empties the Warm store on activation),
+            // so resolve its card content from there; parked (warm) projects
+            // resolve from their Warm store, dormant ones stay placeholders.
+            let (item, state_label) = if is_active {
+                let ws = match &self.monitor_set {
+                    MonitorSet::Normal { monitors, active_monitor_idx, .. } => {
+                        let mon = &monitors[*active_monitor_idx];
+                        mon.workspaces
+                            .get(mon.active_workspace_idx)
+                            .or_else(|| mon.workspaces.first())
+                    }
+                    _ => None,
+                };
+                match ws {
+                    Some(ws) => (ProjectOverviewItem::Warm(ws), "active"),
+                    None => (ProjectOverviewItem::Placeholder, "active"),
+                }
+            } else {
+                match &project.kind {
+                    project::ProjectKind::Warm { workspaces, active_workspace_idx, .. } => {
+                        let ws = workspaces
+                            .get(*active_workspace_idx)
+                            .or_else(|| workspaces.first());
+                        match ws {
+                            Some(ws) => (ProjectOverviewItem::Warm(ws), "warm"),
+                            None => (ProjectOverviewItem::Placeholder, "warm"),
+                        }
+                    }
+                    project::ProjectKind::Dormant => {
+                        (ProjectOverviewItem::Placeholder, "dormant")
                     }
                 }
-                project::ProjectKind::Dormant => (ProjectOverviewItem::Placeholder, "dormant"),
             };
-            let state_label = if is_active { "active" } else { state_label };
 
             entries.push(ProjectOverviewEntry {
                 idx,

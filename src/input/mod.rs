@@ -2895,6 +2895,30 @@ impl State {
 
             let is_overview_open = self.niri.layout.is_overview_open();
 
+            // In the project overview drawer, a left click selects the card
+            // under the cursor; clicking the already-selected front card
+            // commits. A click outside every card closes the drawer.
+            if !is_overview_open
+                && self.niri.layout.is_project_overview_open()
+                && !pointer.is_grabbed()
+                && button == Some(MouseButton::Left)
+                && !mod_down
+            {
+                let location = pointer.current_location();
+                let found = self
+                    .niri
+                    .output_under(location)
+                    .map(|(output, pos)| (output.clone(), pos));
+                if let Some((output, pos)) = found {
+                    if !self.niri.layout.project_overview_click_at(&output, pos) {
+                        self.niri.layout.toggle_project_overview();
+                    }
+                    self.niri.suppressed_buttons.insert(button_code);
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+            }
+
             if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
                 if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
                     let ws_id = ws.id();
