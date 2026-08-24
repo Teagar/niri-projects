@@ -88,6 +88,9 @@ const DRAWER_TAB_TEXT_COLOR: [f64; 4] = [0.02, 0.027, 0.039, 1.];
 /// Duration of the drawer glide animations, in ms.
 const DRAWER_ANIM_MS: u64 = 320;
 
+/// Cache key and value for folder tab textures.
+type TabCache = HashMap<(String, &'static str, u32, u64), TextureBuffer<GlesTexture>>;
+
 #[derive(Debug)]
 pub struct Monitor<W: LayoutElement> {
     /// Output for this monitor.
@@ -128,7 +131,7 @@ pub struct Monitor<W: LayoutElement> {
     /// In-flight glide animations per project card.
     project_drawer_anims: HashMap<usize, Animation>,
     /// Cached folder tab textures, keyed by (name, state, color bits, scale bits).
-    project_tab_cache: RefCell<HashMap<(String, &'static str, u32, u64), TextureBuffer<GlesTexture>>>,
+    project_tab_cache: RefCell<TabCache>,
     /// Cached rounded border overlay textures, keyed by
     /// (color bits, width px, height px).
     project_border_cache: RefCell<HashMap<(u64, i32, i32), TextureBuffer<GlesTexture>>>,
@@ -2062,9 +2065,10 @@ impl<W: LayoutElement> Monitor<W> {
             .entry(key)
             .or_insert_with(|| {
                 generate_project_tab(renderer, name, state, color, scale)
-                    .map_err(|err| warn!("failed to render project tab {name:?}: {err:?}"))
-                    .ok()
-                    .expect("tab generation failed")
+                    .unwrap_or_else(|err| {
+                        warn!("failed to render project tab {name:?}: {err:?}");
+                        panic!("tab generation failed")
+                    })
             })
             .clone()
     }
@@ -2095,9 +2099,10 @@ impl<W: LayoutElement> Monitor<W> {
                     DRAWER_CARD_RADIUS * scale,
                     DRAWER_BORDER_WIDTH * scale,
                 )
-                .map_err(|err| warn!("failed to render project border: {err:?}"))
-                .ok()
-                .expect("border generation failed")
+                .unwrap_or_else(|err| {
+                    warn!("failed to render project border: {err:?}");
+                    panic!("border generation failed")
+                })
             })
             .clone()
     }
