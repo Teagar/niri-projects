@@ -80,7 +80,7 @@ const DRAWER_TAB_RADIUS: f64 = 10.;
 const DRAWER_TAB_INSET_X: f64 = 22.;
 const DRAWER_TAB_STAGGER_X: f64 = 46.;
 /// Drawer backdrop color.
-const DRAWER_BACKDROP_COLOR: [f32; 4] = [0.043, 0.051, 0.071, 0.985];
+const DRAWER_BACKDROP_COLOR: [f32; 4] = [0.043, 0.051, 0.071, 1.];
 /// Placeholder (dormant) card fill.
 const DRAWER_PLACEHOLDER_COLOR: [f32; 4] = [0.071, 0.082, 0.11, 1.];
 /// Tab text color (dark on colored tab).
@@ -2122,25 +2122,17 @@ impl<W: LayoutElement> Monitor<W> {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
 
-        // Dark backdrop behind everything.
-        let backdrop_buffer = SolidColorBuffer::new(self.view_size, DRAWER_BACKDROP_COLOR);
-        let elem = MonitorInnerRenderElement::SolidColor(SolidColorRenderElement::from_buffer(
-            &backdrop_buffer,
-            Point::from((0., 0.)),
-            1.,
-            Kind::Unspecified,
-        ));
-        let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-        let elem = RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
-        push(elem);
+        // NOTE: smithay renders pushed elements in REVERSE order — the first
+        // pushed element ends up on top. So within the frame we push:
+        //   per card (front to back): dim, tab, border, content
+        // and the backdrop LAST so it lands at the bottom of the stack.
 
         let (card_rect, pose) = self.project_drawer_geometry(scale);
-        let card_base_loc =
-            card_rect.loc.to_physical_precise_round(scale);
+        let card_base_loc = card_rect.loc.to_physical_precise_round(scale);
 
-        // Deepest cards first so the selected card ends up on top.
+        // Front card first so it lands on top.
         let mut ordered: Vec<&ProjectOverviewEntry<W>> = entries.iter().collect();
-        ordered.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+        ordered.sort_by(|a, b| a.depth.total_cmp(&b.depth));
 
         for entry in ordered {
             // Animated depth if gliding, static target otherwise.
@@ -2158,13 +2150,100 @@ impl<W: LayoutElement> Monitor<W> {
             // Card content region (physical px).
             let card_w_px = ((card_rect.size.w * size_factor) * scale).round() as i32;
             let card_h_px = ((card_rect.size.h * size_factor) * scale).round() as i32;
-            let content_loc = Point::<i32, Physical>::from((
-                card_base_loc.x,
-                card_base_loc.y + dy_phys,
-            ));
+            let content_loc =
+                Point::<i32, Physical>::from((card_base_loc.x, card_base_loc.y + dy_phys));
             let tab_h_phys = (DRAWER_TAB_HEIGHT * scale).round() as i32;
 
-            // ── Content ──────────────────────────────────────────────
+            let gles = ctx.as_gles();
+
+            // ── Depth dimming overlay (topmost within this card) ─────
+            if dim_alpha > 0.001 {
+                let total_h = tab_h_phys + card_h_px;
+                let dim_size = Size::from((
+                    card_w_px.max(1) as f64 / scale,
+                    total_h.max(1) as f64 / scale,
+                ));
+                let dim = SolidColorBuffer::new(dim_size, [0., 0., 0., dim_alpha as f32]);
+                let dim_loc =
+                    Point::<i32, Physical>::from((content_loc.x, content_loc.y - tab_h_phys));
+                let elem = MonitorInnerRenderElement::SolidColor(
+                    SolidColorRenderElement::from_buffer(
+                        &dim,
+                        Point::from((0., 0.)),
+                        1.,
+                        Kind::Unspecified,
+                    ),
+                );
+                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                let elem =
+                    RelocateRenderElement::from_element(elem, dim_loc, Relocate::Relative);
+                push(elem);
+            }
+
+            // ── Folder tab ───────────────────────────────────────────
+            let tab = self.project_tab(
+                gles.renderer,
+                &entry.name,
+                entry.state_label,
+                entry.color,
+                scale,
+            );
+            let tab_size = tab.logical_size();
+            let max_stagger = (card_rect.size.w - tab_size.w).max(0.);
+            let stagger = ((DRAWER_TAB_INSET_X
+                + DRAWER_TAB_STAGGER_X * entry.idx as f64)
+            .min(max_stagger))
+            .round();
+            let tab_loc = Point::<i32, Physical>::from((
+                card_base_loc.x + (stagger * scale).round() as i32,
+                content_loc.y - tab_h_phys,
+            ));
+            let tab_logical = Point::from((
+                tab_loc.x as f64 / scale,
+                tab_loc.y as f64 / scale,
+            ));
+            let elem = MonitorInnerRenderElement::Texture(PrimaryGpuTextureRenderElement(
+                TextureRenderElement::from_texture_buffer(
+                    tab,
+                    tab_logical,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
+            ));
+            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+            let elem = RelocateRenderElement::from_element(elem, tab_loc, Relocate::Relative);
+            push(elem);
+
+            // ── Border overlay ───────────────────────────────────────
+            let border = self.project_border(
+                gles.renderer,
+                entry.color,
+                card_w_px.max(1),
+                card_h_px.max(1),
+                scale,
+            );
+            let border_logical = Point::from((
+                content_loc.x as f64 / scale,
+                content_loc.y as f64 / scale,
+            ));
+            let elem = MonitorInnerRenderElement::Texture(PrimaryGpuTextureRenderElement(
+                TextureRenderElement::from_texture_buffer(
+                    border,
+                    border_logical,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
+            ));
+            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+            let elem =
+                RelocateRenderElement::from_element(elem, content_loc, Relocate::Relative);
+            push(elem);
+
+            // ── Content (bottom-most within this card) ───────────────
             match &entry.item {
                 ProjectOverviewItem::Warm(ws) => {
                     // Fit the workspace render into the card.
@@ -2183,7 +2262,7 @@ impl<W: LayoutElement> Monitor<W> {
                             let inner = MonitorInnerRenderElement::Workspace(cropped);
                             let scaled = RescaleRenderElement::from_element(
                                 inner,
-                                Point::from((0, 0)),
+                                Point::default(),
                                 fit_factor,
                             );
                             push(RelocateRenderElement::from_element(
@@ -2224,102 +2303,28 @@ impl<W: LayoutElement> Monitor<W> {
                         ),
                     );
                     let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-                    let elem = RelocateRenderElement::from_element(elem, content_loc, Relocate::Relative);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        content_loc,
+                        Relocate::Relative,
+                    );
                     push(elem);
                 }
             }
-
-            // ── Border overlay ───────────────────────────────────────
-            let gles = ctx.as_gles();
-            let border = self.project_border(
-                gles.renderer,
-                entry.color,
-                card_w_px.max(1),
-                card_h_px.max(1),
-                scale,
-            );
-            let border_loc = Point::from((
-                content_loc.x as f64 / scale,
-                content_loc.y as f64 / scale,
-            ));
-            let elem = MonitorInnerRenderElement::Texture(
-                PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                    border,
-                    border_loc,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                )),
-            );
-            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-            let elem = RelocateRenderElement::from_element(elem, content_loc, Relocate::Relative);
-            push(elem);
-
-            // ── Folder tab ───────────────────────────────────────────
-            let tab = self.project_tab(
-                gles.renderer,
-                &entry.name,
-                entry.state_label,
-                entry.color,
-                scale,
-            );
-            let tab_size = tab.logical_size();
-            let max_stagger =
-                (card_rect.size.w - tab_size.w).max(0.);
-            let stagger = ((DRAWER_TAB_INSET_X
-                + DRAWER_TAB_STAGGER_X * entry.idx as f64)
-                .min(max_stagger))
-            .round();
-            let tab_loc = Point::<i32, Physical>::from((
-                card_base_loc.x + (stagger * scale).round() as i32,
-                content_loc.y - tab_h_phys,
-            ));
-            let tab_logical = Point::from((
-                tab_loc.x as f64 / scale,
-                tab_loc.y as f64 / scale,
-            ));
-            let elem = MonitorInnerRenderElement::Texture(
-                PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                    tab,
-                    tab_logical,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                )),
-            );
-            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-            let elem = RelocateRenderElement::from_element(elem, tab_loc, Relocate::Relative);
-            push(elem);
-
-            // ── Depth dimming overlay (above this card, below the next) ──
-            if dim_alpha > 0.001 {
-                let total_h = tab_h_phys + card_h_px;
-                let dim_size = Size::from((
-                    card_w_px.max(1) as f64 / scale,
-                    total_h.max(1) as f64 / scale,
-                ));
-                let dim = SolidColorBuffer::new(dim_size, [0., 0., 0., dim_alpha as f32]);
-                let dim_loc = Point::<i32, Physical>::from((
-                    content_loc.x,
-                    content_loc.y - tab_h_phys,
-                ));
-                let elem = MonitorInnerRenderElement::SolidColor(
-                    SolidColorRenderElement::from_buffer(
-                        &dim,
-                        Point::from((0., 0.)),
-                        1.,
-                        Kind::Unspecified,
-                    ),
-                );
-                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-                let elem = RelocateRenderElement::from_element(elem, dim_loc, Relocate::Relative);
-                push(elem);
-            }
         }
-    }
 
+        // Dark backdrop behind all cards — pushed LAST so it lands at the bottom.
+        let backdrop_buffer = SolidColorBuffer::new(self.view_size, DRAWER_BACKDROP_COLOR);
+        let elem = MonitorInnerRenderElement::SolidColor(SolidColorRenderElement::from_buffer(
+            &backdrop_buffer,
+            Point::from((0., 0.)),
+            1.,
+            Kind::Unspecified,
+        ));
+        let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+        let elem = RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
+        push(elem);
+    }
 
     pub fn render_workspace_shadows<R: NiriRenderer>(
         &self,

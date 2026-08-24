@@ -4409,6 +4409,20 @@ impl Niri {
         push_popups_from_layer!(Layer::Overlay);
         push_normal_from_layer!(Layer::Overlay);
 
+        // Project overview drawer renders on top of everything except
+        // overlay layers and the pointer. smithay draws pushed elements in
+        // reverse order, so pushing early = drawn last = topmost.
+        if self.layout.is_project_overview_open() {
+            let project_overview_push = core::cell::RefCell::new(&mut *push);
+            self.layout.render_project_overview_for_output(
+                ctx.r(),
+                output,
+                focus_ring,
+                &mut |elem| (project_overview_push.borrow_mut())(elem.into()),
+            );
+            return;
+        }
+
         // When rendering above the top layer, we put the regular monitor elements first.
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
         if mon.render_above_top_layer() {
@@ -4418,14 +4432,6 @@ impl Niri {
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
-
-            let project_overview_push = core::cell::RefCell::new(&mut *push);
-            self.layout.render_project_overview_for_output(
-                ctx.r(),
-                output,
-                focus_ring,
-                &mut |elem| (project_overview_push.borrow_mut())(elem.into()),
-            );
 
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
@@ -4471,14 +4477,6 @@ impl Niri {
             }
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
-
-            let project_overview_push = core::cell::RefCell::new(&mut *push);
-            self.layout.render_project_overview_for_output(
-                ctx.r(),
-                output,
-                focus_ring,
-                &mut |elem| (project_overview_push.borrow_mut())(elem.into()),
-            );
 
             for (ws, geo) in mon.workspaces_with_render_geo() {
                 // The render element namespace. This will be set to the workspace index for
