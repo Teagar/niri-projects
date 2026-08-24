@@ -2338,20 +2338,16 @@ impl State {
                 self.niri.layout.toggle_project_overview();
                 self.niri.queue_redraw_all();
             }
-            Action::ProjectOverviewFocusSlotPrev => {
-                self.niri.layout.project_overview_focus_slot_prev();
+            Action::ProjectOverviewPrev => {
+                self.niri.layout.project_overview_prev();
                 self.niri.queue_redraw_all();
             }
-            Action::ProjectOverviewFocusSlotNext => {
-                self.niri.layout.project_overview_focus_slot_next();
+            Action::ProjectOverviewNext => {
+                self.niri.layout.project_overview_next();
                 self.niri.queue_redraw_all();
             }
-            Action::ProjectOverviewFocusDepthCloser => {
-                self.niri.layout.project_overview_focus_depth_closer();
-                self.niri.queue_redraw_all();
-            }
-            Action::ProjectOverviewFocusDepthFurther => {
-                self.niri.layout.project_overview_focus_depth_further();
+            Action::ProjectOverviewCommit => {
+                self.niri.layout.project_overview_commit();
                 self.niri.queue_redraw_all();
             }
             Action::ToggleWindowUrgent(id) => {
@@ -3270,39 +3266,23 @@ impl State {
                     }
                 }
 
-                // Mod+scroll in the overview cycles the project depth stack of the
-                // slot under the cursor (up = bring card to front).
-                if should_handle_in_overview && modifiers == mod_key.to_modifiers() {
+                // Mod+scroll in the project overview drawer cycles selection.
+                if self.niri.layout.is_project_overview_open()
+                    && modifiers == mod_key.to_modifiers()
+                {
                     let vertical = vertical_amount_v120.unwrap_or(0.);
                     let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
-                    if ticks != 0 {
-                        let pointer = self.niri.seat.get_pointer().unwrap();
-                        let pos = pointer.current_location();
-                        let under = self
-                            .niri
-                            .output_under(pos)
-                            .map(|(output, pos)| (output.clone(), pos));
-                        if let Some((output, pos_within_output)) = under {
-                            for _ in 0..ticks {
-                                self.niri.layout.project_overview_depth_cycle_at_point(
-                                    &output,
-                                    pos_within_output,
-                                    false,
-                                );
-                            }
-                            for _ in ticks..0 {
-                                self.niri.layout.project_overview_depth_cycle_at_point(
-                                    &output,
-                                    pos_within_output,
-                                    true,
-                                );
-                            }
-                            self.niri.queue_redraw(&output);
+                    if ticks > 0 {
+                        for _ in 0..ticks {
+                            self.niri.layout.project_overview_next();
                         }
+                        self.niri.queue_redraw_all();
+                    } else if ticks < 0 {
+                        for _ in ticks..0 {
+                            self.niri.layout.project_overview_prev();
+                        }
+                        self.niri.queue_redraw_all();
                     }
-
-                    // Consume the event; Mod+scroll has no other meaning in the overview.
-                    return;
                 }
 
                 let vertical = vertical_amount_v120.unwrap_or(0.);

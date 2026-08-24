@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::iter::zip;
@@ -5,11 +6,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use niri_config::{CornerRadius, LayoutPart};
+use pangocairo::cairo::{self, ImageSurface};
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
 use super::scrolling::{Column, ColumnWidth};
@@ -26,9 +31,11 @@ use crate::animation::{Animation, Clock, Curve};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::RenderLayer;
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+use crate::render_helpers::renderer::{AsGlesRenderer, NiriRenderer};
 use crate::render_helpers::shadow::ShadowRenderElement;
-use crate::render_helpers::solid_color::SolidColorRenderElement;
+use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
@@ -50,20 +57,36 @@ const WORKSPACE_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
 /// This constant is tied to the default dnd-edge-workspace-switch max-speed setting.
 const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 
-/// Horizontal fan offset between stacked project overview cards, in screen pixels.
-const PROJECT_OVERVIEW_FAN_STEP_X: f64 = 20.;
-/// Vertical fan offset between stacked project overview cards, in screen pixels.
-const PROJECT_OVERVIEW_FAN_STEP_Y: f64 = 14.;
-/// How much a card recedes in size for each depth step in the fan.
-const PROJECT_OVERVIEW_FAN_RECEDE: f64 = 0.07;
-/// Maximum depth at which cards are still drawn (deeper ones clamp to this pose).
-const PROJECT_OVERVIEW_MAX_POSE_DEPTH: f64 = 4.;
-/// Upward shift of the focused slot stack, in screen pixels.
-const PROJECT_OVERVIEW_FOCUS_LIFT_Y: f64 = 16.;
-/// Extra scale of the focused slot stack while lifted.
-const PROJECT_OVERVIEW_FOCUS_LIFT_SCALE: f64 = 1.03;
-/// Duration of the project overview fan animations, in ms.
-const PROJECT_OVERVIEW_ANIM_MS: u64 = 220;
+// ── Project overview drawer geometry (screen pixels, multiplied by scale) ──
+
+/// Card width as a fraction of the output view width.
+const DRAWER_CARD_WIDTH_FRAC: f64 = 0.62;
+/// Vertical center of the card block, as a fraction of the view height.
+const DRAWER_CARD_CENTER_Y_FRAC: f64 = 0.52;
+/// Downward offset per depth step behind the front card.
+const DRAWER_STEP_Y: f64 = 26.;
+/// Scale reduction per depth step.
+const DRAWER_SCALE_STEP: f64 = 0.06;
+/// Darkening overlay alpha added per depth step.
+const DRAWER_DIM_STEP: f64 = 0.16;
+/// Maximum visible depth steps behind the front card.
+const DRAWER_MAX_VISIBLE_DEPTH: f64 = 3.;
+/// Card corner radius and border width.
+const DRAWER_CARD_RADIUS: f64 = 14.;
+const DRAWER_BORDER_WIDTH: f64 = 2.;
+/// Folder tab geometry.
+const DRAWER_TAB_HEIGHT: f64 = 30.;
+const DRAWER_TAB_RADIUS: f64 = 10.;
+const DRAWER_TAB_INSET_X: f64 = 22.;
+const DRAWER_TAB_STAGGER_X: f64 = 46.;
+/// Drawer backdrop color.
+const DRAWER_BACKDROP_COLOR: [f32; 4] = [0.043, 0.051, 0.071, 0.985];
+/// Placeholder (dormant) card fill.
+const DRAWER_PLACEHOLDER_COLOR: [f32; 4] = [0.071, 0.082, 0.11, 1.];
+/// Tab text color (dark on colored tab).
+const DRAWER_TAB_TEXT_COLOR: [f64; 4] = [0.02, 0.027, 0.039, 1.];
+/// Duration of the drawer glide animations, in ms.
+const DRAWER_ANIM_MS: u64 = 320;
 
 #[derive(Debug)]
 pub struct Monitor<W: LayoutElement> {
@@ -100,13 +123,15 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
-    /// Per-slot depth-cycle animations for the project overview fan.
-    ///
-    /// After each depth rotation the animation value glides back to 0; the
-    /// displayed depth of a card is its static depth plus this shift.
-    project_slot_shifts: HashMap<usize, Option<Animation>>,
-    /// Per-slot animated lift (0..1) of the focused stack.
-    project_slot_lifts: HashMap<usize, Animation>,
+    /// Animated drawer depth per project card (project index → depth).
+    project_drawer_depths: HashMap<usize, f64>,
+    /// In-flight glide animations per project card.
+    project_drawer_anims: HashMap<usize, Animation>,
+    /// Cached folder tab textures, keyed by (name, state, color bits, scale bits).
+    project_tab_cache: RefCell<HashMap<(String, &'static str, u32, u64), TextureBuffer<GlesTexture>>>,
+    /// Cached rounded border overlay textures, keyed by
+    /// (color bits, width px, height px).
+    project_border_cache: RefCell<HashMap<(u64, i32, i32), TextureBuffer<GlesTexture>>>,
     /// Regular (non-project) workspaces saved aside while a project is active.
     ///
     /// While a project is active, this monitor holds ONLY the project's
@@ -224,6 +249,7 @@ niri_render_elements! {
         UncroppedInsertHint = InsertHintRenderElement,
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
+        Texture = PrimaryGpuTextureRenderElement,
     }
 }
 
@@ -375,8 +401,10 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
-            project_slot_shifts: HashMap::new(),
-            project_slot_lifts: HashMap::new(),
+            project_drawer_depths: HashMap::new(),
+            project_drawer_anims: HashMap::new(),
+            project_tab_cache: RefCell::new(HashMap::new()),
+            project_border_cache: RefCell::new(HashMap::new()),
             saved_regular_workspaces: None,
             workspace_switch: None,
             clock,
@@ -1153,10 +1181,22 @@ impl<W: LayoutElement> Monitor<W> {
             None => (),
         }
 
-        self.project_slot_shifts
-            .retain(|_, shift| shift.as_ref().is_some_and(|anim| !anim.is_done()));
-        self.project_slot_lifts
-            .retain(|_, anim| !(anim.is_done() && anim.clamped_value() <= 0.));
+        let mut finished = Vec::new();
+        for (&idx, anim) in self.project_drawer_anims.iter_mut() {
+            if anim.is_done() {
+                finished.push(idx);
+            }
+        }
+        for idx in finished {
+            let value = self
+                .project_drawer_anims
+                .get(&idx)
+                .map(Animation::clamped_value);
+            if let Some(value) = value {
+                self.project_drawer_depths.insert(idx, value);
+            }
+            self.project_drawer_anims.remove(&idx);
+        }
 
         for ws in &mut self.workspaces {
             ws.advance_animations();
@@ -1168,9 +1208,8 @@ impl<W: LayoutElement> Monitor<W> {
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
             || self
-                .project_slot_lifts
+                .project_drawer_anims
                 .values()
-                .chain(self.project_slot_shifts.values().flatten())
                 .any(|anim| !anim.is_done())
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
@@ -1911,104 +1950,160 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    /// Render the stacked project overview cards (warm workspaces and dormant
-    /// placeholders) fanned out per slot, behind/on top of the active workspaces.
-    /// Index of the overview slot under the given point.
-    ///
-    /// Slots exist independently of attached workspaces, hence the explicit `max_slot`.
-    pub(super) fn slot_index_at(
-        &self,
-        pos_within_output: Point<f64, Logical>,
-        max_slot: usize,
-    ) -> Option<usize> {
-        let zoom = self.overview_zoom();
-        let ws_size = self.workspace_size(zoom);
-        let gap = self.workspace_gap(zoom);
-        let ws_height_with_gap = ws_size.h + gap;
-
-        let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.);
-
-        if pos_within_output.x < static_offset.x
-            || pos_within_output.x >= static_offset.x + ws_size.w
-        {
-            return None;
-        }
-
-        let first_ws_y = -self.workspace_render_idx() * ws_height_with_gap;
-        let rel_y = pos_within_output.y - first_ws_y - static_offset.y;
-        if rel_y < 0. {
-            return None;
-        }
-
-        let slot = (rel_y / ws_height_with_gap).floor() as usize;
-        (slot < max_slot).then_some(slot)
-    }
-
-    /// Reset all project overview fan animation state.
+    /// Reset all project overview drawer animation state.
     pub(super) fn project_overview_reset_anims(&mut self) {
-        self.project_slot_shifts.clear();
-        self.project_slot_lifts.clear();
+        self.project_drawer_depths.clear();
+        self.project_drawer_anims.clear();
     }
 
-    /// Animate the focused stack rising, and all other stacks settling back.
-    pub(super) fn project_overview_animate_focus(&mut self, focused_slot: usize) {
-        let mut slots: Vec<usize> = self.project_slot_lifts.keys().copied().collect();
-        if !slots.contains(&focused_slot) {
-            slots.push(focused_slot);
-        }
+    /// Snap every card to its settled depth instantly.
+    pub(super) fn project_drawer_settle(&mut self) {
+        self.project_overview_reset_anims();
+    }
 
-        for slot in slots {
-            let rising = slot == focused_slot;
-            let from = self
-                .project_slot_lifts
-                .get(&slot)
-                .map_or(0., Animation::clamped_value);
-            let to = if rising { 1. } else { 0. };
-            if !rising && from <= 0. {
-                self.project_slot_lifts.remove(&slot);
-                continue;
-            }
-            if from == to {
+    /// Animate each card gliding to its depth relative to the new selection.
+    ///
+    /// Cards keep continuous depths: the wrapping card slides the long way
+    /// through the intermediate poses instead of teleporting.
+    pub(super) fn project_drawer_animate_to(&mut self, targets: &HashMap<usize, f64>) {
+        for (&idx, &target) in targets {
+            let current = match self.project_drawer_anims.get(&idx) {
+                Some(anim) => anim.clamped_value(),
+                None => *self.project_drawer_depths.get(&idx).unwrap_or(&target),
+            };
+            if (current - target).abs() < 0.001 {
+                self.project_drawer_depths.insert(idx, target);
                 continue;
             }
             let anim = Animation::ease(
                 self.clock.clone(),
-                from,
-                to,
+                current,
+                target,
                 0.,
-                PROJECT_OVERVIEW_ANIM_MS,
+                DRAWER_ANIM_MS,
                 Curve::EaseOutCubic,
             );
-            self.project_slot_lifts.insert(slot, anim);
+            self.project_drawer_depths.insert(idx, current);
+            self.project_drawer_anims.insert(idx, anim);
         }
     }
 
-    /// Animate the fan shuffle for a depth rotation in `slot`.
+    /// Base geometry of the drawer card stack (before depth offsets).
     ///
-    /// The static depths were already rotated by `dir`; the shift animation
-    /// starts at `-dir` so cards appear to glide from their previous poses.
-    pub(super) fn project_overview_animate_depth_shift(&mut self, slot: usize, dir: isize) {
-        let prev = self
-            .project_slot_shifts
-            .get(&slot)
-            .and_then(Option::as_ref)
-            .map_or(0., Animation::clamped_value);
+    /// Returns the card rectangle and its pose function mapping fractional
+    /// depth to (y-offset in physical px, size factor).
+    fn project_drawer_geometry(
+        &self,
+        scale: f64,
+    ) -> (
+        Rectangle<f64, Logical>,
+        impl Fn(f64) -> (i32, f64) + '_,
+    ) {
+        let view = self.view_size;
+        let card_w = view.w * DRAWER_CARD_WIDTH_FRAC;
+        let card_h = card_w * view.h / view.w;
+        let x = (view.w - card_w) / 2.;
+        let y = view.h * DRAWER_CARD_CENTER_Y_FRAC - card_h / 2.;
+        let card_rect = Rectangle::new(Point::from((x, y)), Size::from((card_w, card_h)));
 
-        // An interrupted glide folds into the new one seamlessly.
-        let anim = Animation::ease(
-            self.clock.clone(),
-            prev - dir as f64,
-            0.,
-            0.,
-            PROJECT_OVERVIEW_ANIM_MS,
-            Curve::EaseOutCubic,
-        );
-        self.project_slot_shifts.insert(slot, Some(anim));
+        let pose = move |depth: f64| -> (i32, f64) {
+            let d = depth.clamp(0., DRAWER_MAX_VISIBLE_DEPTH);
+            let dy = DRAWER_STEP_Y * d * scale;
+            let size_factor = 1. - DRAWER_SCALE_STEP * d;
+            (dy.round() as i32, size_factor)
+        };
+
+        (card_rect, pose)
     }
 
-    /// Render the stacked project overview cards.
+    /// Drawer card under the given point, front-most first.
     ///
-    /// Card contents (warm workspaces) go through `push`.
+    /// Returns the stack position: 0 is the front (selected) card.
+    pub(super) fn project_drawer_hit_test(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+        len: usize,
+    ) -> Option<usize> {
+        let scale = self.scale.fractional_scale();
+        let (rect, pose) = self.project_drawer_geometry(scale);
+
+        let max_visible = (len as f64).min(DRAWER_MAX_VISIBLE_DEPTH + 1.) as usize;
+        for stack_pos in 0..max_visible {
+            let (dy, size_factor) = pose(stack_pos as f64);
+            let hit_rect = Rectangle::new(
+                Point::from((rect.loc.x, rect.loc.y + dy as f64 / scale)),
+                Size::from((rect.size.w * size_factor, rect.size.h * size_factor)),
+            );
+            if hit_rect.contains(pos_within_output) {
+                return Some(stack_pos);
+            }
+        }
+        None
+    }
+
+    /// Folder tab texture for one project card, cached by content.
+    fn project_tab(
+        &self,
+        renderer: &mut GlesRenderer,
+        name: &str,
+        state: &'static str,
+        color: [f32; 4],
+        scale: f64,
+    ) -> TextureBuffer<GlesTexture> {
+        let key = (
+            name.to_string(),
+            state,
+            color.iter().fold(0u32, |acc, c| acc.wrapping_mul(31).wrapping_add((c * 255.).round() as u32)),
+            scale.to_bits(),
+        );
+
+        let mut cache = self.project_tab_cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                generate_project_tab(renderer, name, state, color, scale)
+                    .map_err(|err| warn!("failed to render project tab {name:?}: {err:?}"))
+                    .ok()
+                    .expect("tab generation failed")
+            })
+            .clone()
+    }
+
+    /// Rounded border overlay texture for one card size, cached by geometry.
+    fn project_border(
+        &self,
+        renderer: &mut GlesRenderer,
+        color: [f32; 4],
+        width_px: i32,
+        height_px: i32,
+        scale: f64,
+    ) -> TextureBuffer<GlesTexture> {
+        let color_bits = color.iter().fold(0u64, |acc, c| {
+            acc.wrapping_mul(31).wrapping_add((c * 255.).round() as u64)
+        });
+        let key = (color_bits, width_px, height_px);
+
+        let mut cache = self.project_border_cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                generate_project_border(
+                    renderer,
+                    color,
+                    width_px,
+                    height_px,
+                    DRAWER_CARD_RADIUS * scale,
+                    DRAWER_BORDER_WIDTH * scale,
+                )
+                .map_err(|err| warn!("failed to render project border: {err:?}"))
+                .ok()
+                .expect("border generation failed")
+            })
+            .clone()
+    }
+
+    /// Render the project overview drawer: a folder-stack of one card per
+    /// project over a dark backdrop.
     pub(super) fn render_project_overview<R>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -2016,7 +2111,7 @@ impl<W: LayoutElement> Monitor<W> {
         entries: &[ProjectOverviewEntry<W>],
         push: &mut dyn FnMut(MonitorRenderElement<R>),
     ) where
-        R: NiriRenderer + crate::render_helpers::renderer::AsGlesRenderer,
+        R: NiriRenderer + AsGlesRenderer,
     {
         if entries.is_empty() {
             return;
@@ -2025,89 +2120,61 @@ impl<W: LayoutElement> Monitor<W> {
         let _span = tracy_client::span!("Monitor::render_project_overview");
 
         let scale = self.scale.fractional_scale();
-        let height = (self.view_size.h * scale).ceil() as i32;
         let zoom = self.overview_zoom();
 
-        let ws_size = self.workspace_size(zoom);
-        let gap = self.workspace_gap(zoom);
-        let ws_height_with_gap = ws_size.h + gap;
+        // Dark backdrop behind everything.
+        let backdrop_buffer = SolidColorBuffer::new(self.view_size, DRAWER_BACKDROP_COLOR);
+        let elem = MonitorInnerRenderElement::SolidColor(SolidColorRenderElement::from_buffer(
+            &backdrop_buffer,
+            Point::from((0., 0.)),
+            1.,
+            Kind::Unspecified,
+        ));
+        let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+        let elem = RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
+        push(elem);
 
-        let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.);
-        let static_offset = static_offset
-            .to_physical_precise_round(scale)
-            .to_logical(scale);
+        let (card_rect, pose) = self.project_drawer_geometry(scale);
+        let card_base_loc =
+            card_rect.loc.to_physical_precise_round(scale);
 
-        let first_ws_y = -self.workspace_render_idx() * ws_height_with_gap;
-        let first_ws_y = round_logical_in_physical(scale, first_ws_y);
+        // Deepest cards first so the selected card ends up on top.
+        let mut ordered: Vec<&ProjectOverviewEntry<W>> = entries.iter().collect();
+        ordered.sort_by(|a, b| b.depth.total_cmp(&a.depth));
 
-        // Crop to an infinite-width, workspace-high region like the overview pass above.
-        let crop_bounds = Rectangle::new(
-            Point::from((-i32::MAX / 2, 0)),
-            Size::from((i32::MAX, height)),
-        );
-
-        // Group entries by slot, keeping their order.
-        let mut by_slot: Vec<(usize, Vec<&ProjectOverviewEntry<W>>)> = Vec::new();
-        for entry in entries {
-            match by_slot.last_mut() {
-                Some((slot, stack)) if *slot == entry.slot => stack.push(entry),
-                _ => by_slot.push((entry.slot, vec![entry])),
+        for entry in ordered {
+            // Animated depth if gliding, static target otherwise.
+            let depth = match self.project_drawer_anims.get(&entry.idx) {
+                Some(anim) => anim.clamped_value(),
+                None => entry.depth,
+            };
+            if depth > DRAWER_MAX_VISIBLE_DEPTH + 0.4 || depth < -0.4 {
+                continue;
             }
-        }
 
-        for (slot, stack) in by_slot {
-            let len = stack.len() as f64;
+            let (dy_phys, size_factor) = pose(depth.max(0.));
+            let dim_alpha = (DRAWER_DIM_STEP * depth.max(0.)).min(0.6);
 
-            let shift = self
-                .project_slot_shifts
-                .get(&slot)
-                .and_then(Option::as_ref)
-                .map_or(0., Animation::clamped_value);
-            let lift = self
-                .project_slot_lifts
-                .get(&slot)
-                .map_or(0., Animation::clamped_value);
+            // Card content region (physical px).
+            let card_w_px = ((card_rect.size.w * size_factor) * scale).round() as i32;
+            let card_h_px = ((card_rect.size.h * size_factor) * scale).round() as i32;
+            let content_loc = Point::<i32, Physical>::from((
+                card_base_loc.x,
+                card_base_loc.y + dy_phys,
+            ));
+            let tab_h_phys = (DRAWER_TAB_HEIGHT * scale).round() as i32;
 
-            let y = first_ws_y + slot as f64 * ws_height_with_gap;
-            let base_loc: Point<f64, Logical> = Point::from((0., y)) + static_offset;
-            let base_phys: Point<i32, Physical> = base_loc.to_physical_precise_round(scale);
-
-            // Pose of a card at fractional fan depth: relocation offset and size
-            // factor. Deeper cards peek up-right like sheets in a folder and
-            // recede slightly; the focused stack rises toward the viewer.
-            let pose = |depth: f64| -> (Point<i32, Physical>, f64) {
-                let d = depth.clamp(0., PROJECT_OVERVIEW_MAX_POSE_DEPTH);
-                let recede = 1. / (1. + PROJECT_OVERVIEW_FAN_RECEDE * d);
-                let dx = (PROJECT_OVERVIEW_FAN_STEP_X * d * scale).round() as i32;
-                let dy = (-(PROJECT_OVERVIEW_FAN_STEP_Y * d)
-                    - PROJECT_OVERVIEW_FOCUS_LIFT_Y * lift)
-                    * scale;
-                let size_factor =
-                    zoom * recede * (1. + (PROJECT_OVERVIEW_FOCUS_LIFT_SCALE - 1.) * lift);
-                (
-                    Point::from((base_phys.x + dx, base_phys.y + dy.round() as i32)),
-                    size_factor,
-                )
-            };
-            let lerp_pose = |from_d: f64, to_d: f64, t: f64| -> (Point<i32, Physical>, f64) {
-                let (from_loc, from_size) = pose(from_d);
-                let (to_loc, to_size) = pose(to_d);
-                (
-                    Point::from((
-                        (from_loc.x as f64 + (to_loc.x - from_loc.x) as f64 * t).round() as i32,
-                        (from_loc.y as f64 + (to_loc.y - from_loc.y) as f64 * t).round() as i32,
-                    )),
-                    from_size + (to_size - from_size) * t,
-                )
-            };
-
-            let render_card = |mut ctx: RenderCtx<R>,
-                               entry: &ProjectOverviewEntry<W>,
-                               loc: Point<i32, Physical>,
-                               size_factor: f64,
-                               push: &mut dyn FnMut(MonitorRenderElement<R>)| {
-                if let ProjectOverviewItem::Warm(ws) = &entry.item {
-                    let xray_pos = XrayPos::new(base_loc, zoom);
+            // ── Content ──────────────────────────────────────────────
+            match &entry.item {
+                ProjectOverviewItem::Warm(ws) => {
+                    // Fit the workspace render into the card.
+                    let fit_factor =
+                        card_rect.size.w * size_factor / self.view_size.w * zoom;
+                    let crop_bounds = Rectangle::new(
+                        Point::from((-i32::MAX / 2, 0)),
+                        Size::from((i32::MAX, i32::MAX)),
+                    );
+                    let xray_pos = XrayPos::new(card_rect.loc, zoom);
 
                     let mut push_card = |elem: WorkspaceRenderElement<R>| {
                         if let Some(cropped) =
@@ -2117,11 +2184,11 @@ impl<W: LayoutElement> Monitor<W> {
                             let scaled = RescaleRenderElement::from_element(
                                 inner,
                                 Point::from((0, 0)),
-                                size_factor,
+                                fit_factor,
                             );
                             push(RelocateRenderElement::from_element(
                                 scaled,
-                                loc,
+                                content_loc,
                                 Relocate::Relative,
                             ));
                         }
@@ -2142,60 +2209,117 @@ impl<W: LayoutElement> Monitor<W> {
                         &mut push_card,
                     );
                 }
-            };
-
-            // Compute each card's animated display depth. During a shuffle the
-            // wrapping card doesn't teleport through the deck: the card coming
-            // to the front pulls out over the stack, the one leaving the front
-            // tucks underneath it.
-            enum Wrap {
-                /// Deep → front; drawn on top. `t` goes 0 → 1.
-                PullOut { t: f64 },
-                /// Front → deep; drawn underneath. `t` goes 0 → 1.
-                TuckUnder { t: f64 },
-            }
-
-            let mut cards: Vec<(&ProjectOverviewEntry<W>, f64, Option<Wrap>)> = Vec::new();
-            for entry in &stack {
-                let d = entry.depth as f64 + shift;
-                let wrap = if d < 0. {
-                    Some(Wrap::PullOut { t: 1. + d })
-                } else if d >= len {
-                    Some(Wrap::TuckUnder { t: d - (len - 1.) })
-                } else {
-                    None
-                };
-                cards.push((entry, d, wrap));
-            }
-
-            // Tuck-under first (bottom of the z stack).
-            for (entry, _, wrap) in &cards {
-                if let Some(Wrap::TuckUnder { t }) = wrap {
-                    let (loc, size) = lerp_pose(0., len - 1., *t);
-                    render_card(ctx.r(), entry, loc, size, push);
+                ProjectOverviewItem::Placeholder => {
+                    let fill_size = Size::from((
+                        card_w_px.max(1) as f64 / scale,
+                        card_h_px.max(1) as f64 / scale,
+                    ));
+                    let fill = SolidColorBuffer::new(fill_size, DRAWER_PLACEHOLDER_COLOR);
+                    let elem = MonitorInnerRenderElement::SolidColor(
+                        SolidColorRenderElement::from_buffer(
+                            &fill,
+                            Point::from((0., 0.)),
+                            1.,
+                            Kind::Unspecified,
+                        ),
+                    );
+                    let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                    let elem = RelocateRenderElement::from_element(elem, content_loc, Relocate::Relative);
+                    push(elem);
                 }
             }
 
-            // Regular cards, deepest first so shallower ones draw on top.
-            let mut regular: Vec<_> = cards
-                .iter()
-                .filter(|(_, _, wrap)| wrap.is_none())
-                .collect();
-            regular.sort_by(|a, b| b.1.total_cmp(&a.1));
-            for (entry, d, _) in regular {
-                let (loc, size) = pose(*d);
-                render_card(ctx.r(), entry, loc, size, push);
-            }
+            // ── Border overlay ───────────────────────────────────────
+            let gles = ctx.as_gles();
+            let border = self.project_border(
+                gles.renderer,
+                entry.color,
+                card_w_px.max(1),
+                card_h_px.max(1),
+                scale,
+            );
+            let border_loc = Point::from((
+                content_loc.x as f64 / scale,
+                content_loc.y as f64 / scale,
+            ));
+            let elem = MonitorInnerRenderElement::Texture(
+                PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+                    border,
+                    border_loc,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                )),
+            );
+            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+            let elem = RelocateRenderElement::from_element(elem, content_loc, Relocate::Relative);
+            push(elem);
 
-            // Pull-out last (top of the z stack).
-            for (entry, _, wrap) in &cards {
-                if let Some(Wrap::PullOut { t }) = wrap {
-                    let (loc, size) = lerp_pose(len - 1., 0., *t);
-                    render_card(ctx.r(), entry, loc, size, push);
-                }
+            // ── Folder tab ───────────────────────────────────────────
+            let tab = self.project_tab(
+                gles.renderer,
+                &entry.name,
+                entry.state_label,
+                entry.color,
+                scale,
+            );
+            let tab_size = tab.logical_size();
+            let max_stagger =
+                (card_rect.size.w - tab_size.w).max(0.);
+            let stagger = ((DRAWER_TAB_INSET_X
+                + DRAWER_TAB_STAGGER_X * entry.idx as f64)
+                .min(max_stagger))
+            .round();
+            let tab_loc = Point::<i32, Physical>::from((
+                card_base_loc.x + (stagger * scale).round() as i32,
+                content_loc.y - tab_h_phys,
+            ));
+            let tab_logical = Point::from((
+                tab_loc.x as f64 / scale,
+                tab_loc.y as f64 / scale,
+            ));
+            let elem = MonitorInnerRenderElement::Texture(
+                PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
+                    tab,
+                    tab_logical,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                )),
+            );
+            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+            let elem = RelocateRenderElement::from_element(elem, tab_loc, Relocate::Relative);
+            push(elem);
+
+            // ── Depth dimming overlay (above this card, below the next) ──
+            if dim_alpha > 0.001 {
+                let total_h = tab_h_phys + card_h_px;
+                let dim_size = Size::from((
+                    card_w_px.max(1) as f64 / scale,
+                    total_h.max(1) as f64 / scale,
+                ));
+                let dim = SolidColorBuffer::new(dim_size, [0., 0., 0., dim_alpha as f32]);
+                let dim_loc = Point::<i32, Physical>::from((
+                    content_loc.x,
+                    content_loc.y - tab_h_phys,
+                ));
+                let elem = MonitorInnerRenderElement::SolidColor(
+                    SolidColorRenderElement::from_buffer(
+                        &dim,
+                        Point::from((0., 0.)),
+                        1.,
+                        Kind::Unspecified,
+                    ),
+                );
+                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                let elem = RelocateRenderElement::from_element(elem, dim_loc, Relocate::Relative);
+                push(elem);
             }
         }
     }
+
 
     pub fn render_workspace_shadows<R: NiriRenderer>(
         &self,
@@ -2611,4 +2735,227 @@ impl<W: LayoutElement> Monitor<W> {
             assert_abs_diff_eq!(pos.y, rounded_pos.y, epsilon = 1e-5);
         }
     }
+}
+
+// ── Drawer texture generation ─────────────────────────────────────────────
+
+/// Draw a pango text layout and return its pixel size.
+fn measure_text(text: &str, font: &pango::FontDescription) -> (i32, i32) {
+    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0).unwrap();
+    let cr = cairo::Context::new(&surface).unwrap();
+    let layout = pangocairo::functions::create_layout(&cr);
+    layout.context().set_round_glyph_positions(false);
+    layout.set_single_paragraph_mode(true);
+    layout.set_font_description(Some(font));
+    layout.set_text(text);
+    layout.pixel_size()
+}
+/// Render a folder tab (rounded top rect + dot + name + state) into a texture.
+///
+/// The returned texture's logical size is the tab size in logical pixels.
+fn generate_project_tab(
+    renderer: &mut GlesRenderer,
+    name: &str,
+    state: &'static str,
+    color: [f32; 4],
+    scale: f64,
+) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+    let _span = tracy_client::span!("monitor::generate_project_tab");
+
+    let s = |v: f64| v * scale;
+
+    // Fonts.
+    let mut name_font = pango::FontDescription::from_string("sans-serif Bold 13");
+    name_font.set_absolute_size(s(13.) * pango::SCALE as f64);
+    let mut state_font = pango::FontDescription::from_string("sans-serif 11");
+    state_font.set_absolute_size(s(11.) * pango::SCALE as f64);
+
+    // Measure.
+    let (name_w, name_h) = measure_text(name, &name_font);
+    let state_upper = state.to_uppercase();
+    let (state_w, _) = measure_text(&state_upper, &state_font);
+
+    let pad_x = s(16.).round() as i32;
+    let dot_d = s(6.).round() as i32;
+    let dot_gap = s(8.).round() as i32;
+    let state_gap = s(10.).round() as i32;
+    let width = pad_x * 2 + dot_d + dot_gap + name_w + state_gap + state_w;
+    let height = (s(DRAWER_TAB_HEIGHT)).round() as i32;
+    if width <= 0 || height <= 0 {
+        anyhow::bail!("empty project tab");
+    }
+    let width = min(width, 16383);
+    let height = min(height, 16383);
+
+    // Draw.
+    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+    let cr = cairo::Context::new(&surface)?;
+
+    // Rounded-top-rect path.
+    let radius = s(DRAWER_TAB_RADIUS).min(height as f64 / 2.);
+    cr.new_sub_path();
+    cr.arc(
+        radius,
+        height as f64,
+        radius,
+        std::f64::consts::PI,
+        1.5 * std::f64::consts::PI,
+    );
+    cr.line_to(width as f64 - radius, 0.);
+    cr.arc(
+        width as f64 - radius,
+        height as f64,
+        radius,
+        1.5 * std::f64::consts::PI,
+        2. * std::f64::consts::PI,
+    );
+    cr.line_to(width as f64, height as f64);
+    cr.line_to(0., height as f64);
+    cr.close_path();
+    cr.set_source_rgb(color[0] as f64, color[1] as f64, color[2] as f64);
+    let _ = cr.fill();
+
+    // State dot.
+    let ink_y = (height as f64 - name_h as f64) / 2.;
+    cr.arc(
+        pad_x as f64 + dot_d as f64 / 2.,
+        ink_y + name_h as f64 / 2.,
+        dot_d as f64 / 2.,
+        0.,
+        2. * std::f64::consts::PI,
+    );
+    cr.set_source_rgba(
+        DRAWER_TAB_TEXT_COLOR[0],
+        DRAWER_TAB_TEXT_COLOR[1],
+        DRAWER_TAB_TEXT_COLOR[2],
+        0.55,
+    );
+    let _ = cr.fill();
+
+    // Name.
+    let mut x = pad_x + dot_d + dot_gap;
+    pangocairo_draw_text(
+        &cr,
+        &name_font,
+        DRAWER_TAB_TEXT_COLOR,
+        1.,
+        x as f64,
+        ink_y,
+    );
+
+    // State label.
+    x += name_w + state_gap;
+    pangocairo_draw_text(
+        &cr,
+        &state_font,
+        DRAWER_TAB_TEXT_COLOR,
+        0.75,
+        x as f64,
+        (height as f64 - name_h as f64) / 2. + s(1.),
+    );
+
+    drop(cr);
+    let data = surface.take_data().unwrap();
+    let buffer = TextureBuffer::from_memory(
+        renderer,
+        &data,
+        Fourcc::Argb8888,
+        (width, height),
+        false,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    )?;
+
+    Ok(buffer)
+}
+
+/// Render a rounded-rect border overlay into a texture.
+fn generate_project_border(
+    renderer: &mut GlesRenderer,
+    color: [f32; 4],
+    width_px: i32,
+    height_px: i32,
+    radius: f64,
+    border_w: f64,
+) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+    let _span = tracy_client::span!("monitor::generate_project_border");
+
+    let width = width_px.clamp(1, 16383);
+    let height = height_px.clamp(1, 16383);
+
+    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+    let cr = cairo::Context::new(&surface)?;
+
+    let inset = border_w / 2.;
+    let radius = radius.min((width as f64 - inset * 2.) / 2.)
+        .min((height as f64 - inset * 2.) / 2.);
+    rounded_rect_path(
+        &cr,
+        inset,
+        inset,
+        width as f64 - border_w,
+        height as f64 - border_w,
+        radius,
+    );
+    cr.set_line_width(border_w);
+    cr.set_source_rgba(
+        color[0] as f64,
+        color[1] as f64,
+        color[2] as f64,
+        color[3] as f64,
+    );
+    let _ = cr.stroke();
+
+    drop(cr);
+    let data = surface.take_data().unwrap();
+    let buffer = TextureBuffer::from_memory(
+        renderer,
+        &data,
+        Fourcc::Argb8888,
+        (width, height),
+        false,
+        1.,
+        Transform::Normal,
+        Vec::new(),
+    )?;
+
+    Ok(buffer)
+}
+
+/// Append a rounded rectangle path to the cairo context.
+fn rounded_rect_path(
+    cr: &cairo::Context,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    r: f64,
+) {
+    cr.new_sub_path();
+    cr.arc(x + r, y + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+    cr.arc(x + w - r, y + r, r, 1.5 * std::f64::consts::PI, 2. * std::f64::consts::PI);
+    cr.arc(x + w - r, y + h - r, r, 0., 0.5 * std::f64::consts::PI);
+    cr.arc(x + r, y + h - r, r, 0.5 * std::f64::consts::PI, std::f64::consts::PI);
+    cr.close_path();
+}
+
+/// Draw a text layout onto the cairo context at the given position.
+fn pangocairo_draw_text(
+    cr: &cairo::Context,
+    font: &pango::FontDescription,
+    color: [f64; 4],
+    alpha: f64,
+    x: f64,
+    y: f64,
+) {
+    let layout = pangocairo::functions::create_layout(cr);
+    layout.context().set_round_glyph_positions(false);
+    layout.set_single_paragraph_mode(true);
+    layout.set_font_description(Some(font));
+    let _ = cr.save();
+    cr.set_source_rgba(color[0], color[1], color[2], alpha);
+    cr.move_to(x, y);
+    pangocairo::functions::show_layout(cr, &layout);
+    let _ = cr.restore();
 }

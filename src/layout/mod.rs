@@ -385,10 +385,17 @@ pub struct Layout<W: LayoutElement> {
     active_project_workspace_ids: Vec<WorkspaceId>,
     /// Monotonically increasing color index for the next newly-created project.
     next_project_color_index: usize,
-    /// Focused slot index in the project overview (which workspace slot column).
-    project_overview_focused_slot: usize,
-    /// Depth index per slot in the project overview (which project is on top).
-    project_overview_depth: Vec<usize>,
+    /// Whether the dedicated project overview drawer is open.
+    ///
+    /// Fully independent of the regular overview: projects are only ever
+    /// visible through this drawer, never in the regular overview.
+    project_overview_open: bool,
+    /// Index into `self.projects` of the currently selected card in the drawer.
+    project_overview_selected: usize,
+    /// Card selected when the drawer was last opened. Committing only switches
+    /// projects once the selection has moved away from this origin, so pure
+    /// browsing (open → navigate round-trip → commit) never mutates state.
+    project_overview_origin: usize,
 }
 
 #[derive(Debug)]
@@ -589,20 +596,29 @@ pub enum RenderLayer {
     MovingBetweenWorkspaces,
 }
 
-/// One card in the project overview: a live warm workspace or a placeholder for a dormant one.
+/// One card in the project overview drawer.
 pub(super) enum ProjectOverviewItem<'a, W: LayoutElement> {
-    /// Parked workspace with live windows, rendered in full.
+    /// Warm project: its focused workspace is rendered live as the card content.
     Warm(&'a Workspace<W>),
-    /// Dormant project placeholder (no live content).
+    /// Dormant project (no live content; flat placeholder fill).
     Placeholder,
 }
 
-/// A single stacked card at a slot in the project overview.
+/// A single folder card in the project overview drawer.
 pub(super) struct ProjectOverviewEntry<'a, W: LayoutElement> {
-    /// Slot index (vertical position, matching the active workspace slots).
-    pub slot: usize,
-    /// Fan position: 0 is the front card, higher values fan out behind.
-    pub depth: usize,
+    /// Project index in `Layout::projects` (also the animation key).
+    pub idx: usize,
+    /// Project name shown on the folder tab.
+    pub name: String,
+    /// Card depth relative to the selection: 0 is front, higher is further back.
+    pub depth: f64,
+    /// Tab/border color for this card.
+    pub color: [f32; 4],
+    /// Whether this project is the currently active one.
+    #[allow(dead_code)]
+    pub is_active: bool,
+    /// State label shown on the tab ("active", "warm", "dormant").
+    pub state_label: &'static str,
     pub item: ProjectOverviewItem<'a, W>,
 }
 
@@ -774,8 +790,9 @@ impl<W: LayoutElement> Layout<W> {
             active_project_name: None,
             active_project_workspace_ids: Vec::new(),
             next_project_color_index: 0,
-            project_overview_focused_slot: 0,
-            project_overview_depth: Vec::new(),
+            project_overview_open: false,
+            project_overview_selected: 0,
+            project_overview_origin: 0,
         }
     }
 
@@ -805,8 +822,9 @@ impl<W: LayoutElement> Layout<W> {
             active_project_name: None,
             active_project_workspace_ids: Vec::new(),
             next_project_color_index: 0,
-            project_overview_focused_slot: 0,
-            project_overview_depth: Vec::new(),
+            project_overview_open: false,
+            project_overview_selected: 0,
+            project_overview_origin: 0,
         }
     }
 
@@ -5367,83 +5385,95 @@ impl<W: LayoutElement> Layout<W> {
 
     // ── Project overview ──────────────────────────────────────────────────
 
-    /// Number of workspace slots a project occupies in the overview.
-    ///
-    /// The active project's workspaces are attached to monitors, so count them
-    /// from `active_project_workspace_ids` rather than from (stale) runtime kind.
-    fn project_slot_count(&self, pidx: usize) -> usize {
-        let project = &self.projects[pidx];
-        if self.active_project_name.as_deref() == Some(project.name()) {
-            self.active_project_workspace_ids.len()
-        } else {
-            match &project.kind {
-                project::ProjectKind::Dormant => project.config.workspaces.len(),
-                project::ProjectKind::Warm { workspaces, .. } => workspaces.len(),
-            }
-        }
-    }
-
-    /// Indices of projects that have a card at the given slot, in config order.
-    fn projects_at_slot(&self, slot: usize) -> Vec<usize> {
-        (0..self.projects.len())
-            .filter(|&pidx| slot < self.project_slot_count(pidx))
-            .collect()
-    }
-
-    /// Fan position of a project's card at a slot: 0 is front/on top.
-    ///
-    /// Non-active projects read outward from the active/base card in config
-    /// order: the project right after the active one is the shallowest card,
-    /// higher indices stack progressively deeper.
-    fn project_fan_position(&self, pidx: usize, slot: usize) -> usize {
-        let stack = self.projects_at_slot(slot);
-        if stack.is_empty() {
-            return 0;
-        }
-
-        let len = stack.len();
-        let front = self.project_overview_depth.get(slot).copied().unwrap_or(0) % len;
-        let pos_in_stack = stack.iter().position(|&i| i == pidx).unwrap_or(0);
-        (front + len - pos_in_stack) % len
-    }
-
-    /// Initialize depth state for project overview (one entry per slot).
-    fn init_project_overview_depth(&mut self) {
-        let max_slots = (0..self.projects.len())
-            .map(|pidx| self.project_slot_count(pidx))
-            .max()
-            .unwrap_or(0);
-
-        self.project_overview_depth.resize(max_slots, 0);
-        self.project_overview_focused_slot = self
-            .project_overview_focused_slot
-            .min(max_slots.saturating_sub(1));
+    /// Whether the dedicated project overview drawer is open.
+    pub fn is_project_overview_open(&self) -> bool {
+        self.project_overview_open
     }
 
     pub fn toggle_project_overview(&mut self) {
-        if !self.is_overview_open() {
-            // Opening: initialize depth state and lift the focused stack.
-            self.init_project_overview_depth();
-            self.project_overview_reset_anims();
-            self.toggle_overview();
-            self.project_overview_sync_focus_anim();
+        self.project_overview_open = !self.project_overview_open;
+        if self.project_overview_open {
+            // Start with the active project (or first) selected.
+            let active_idx = self
+                .active_project_name
+                .as_deref()
+                .and_then(|name| self.project_index(name))
+                .unwrap_or(0);
+            self.project_overview_selected = active_idx.min(self.projects.len().saturating_sub(1));
+            self.project_overview_origin = self.project_overview_selected;
+            self.project_overview_sync_selection_anim(true);
         } else {
-            self.toggle_overview();
+            self.project_overview_reset_anims();
         }
     }
 
-    /// Animate the focused stack rising and all other stacks settling.
-    fn project_overview_sync_focus_anim(&mut self) {
-        let slot = self.project_overview_focused_slot;
+    /// Select the previous project card (drawer wraps around).
+    pub fn project_overview_prev(&mut self) {
+        if !self.project_overview_open || self.projects.is_empty() {
+            return;
+        }
+        let len = self.projects.len();
+        self.project_overview_selected =
+            (self.project_overview_selected + len - 1) % len;
+        self.project_overview_sync_selection_anim(false);
+    }
+
+    /// Select the next project card (drawer wraps around).
+    pub fn project_overview_next(&mut self) {
+        if !self.project_overview_open || self.projects.is_empty() {
+            return;
+        }
+        self.project_overview_selected =
+            (self.project_overview_selected + 1) % self.projects.len();
+        self.project_overview_sync_selection_anim(false);
+    }
+
+    /// Commit the current selection and close the drawer.
+    ///
+    /// Switching to the selected project happens only once the user has moved
+    /// the selection away from the card selected at open time; committing an
+    /// untouched (or round-tripped) selection simply closes the drawer.
+    pub fn project_overview_commit(&mut self) {
+        if !self.project_overview_open {
+            return;
+        }
+        let moved = self.project_overview_selected != self.project_overview_origin;
+        let name = self.projects[self.project_overview_selected].name().to_string();
+        self.toggle_project_overview();
+        if moved && self.active_project_name.as_deref() != Some(name.as_str()) {
+            self.switch_to_project(&name);
+        }
+    }
+
+    /// Animate every card gliding to its depth relative to the selection.
+    ///
+    /// On open, cards start settled (no glide-in from stale positions).
+    fn project_overview_sync_selection_anim(&mut self, instant: bool) {
+        let selected = self.project_overview_selected;
+        let len = self.projects.len();
         let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
             return;
         };
         for mon in monitors {
-            mon.project_overview_animate_focus(slot);
+            if instant {
+                mon.project_drawer_settle();
+            } else {
+                let mut targets = HashMap::new();
+                for i in 0..len {
+                    let mut raw = i as isize - selected as isize;
+                    if raw > len as isize / 2 {
+                        raw -= len as isize;
+                    } else if raw < -(len as isize) / 2 {
+                        raw += len as isize;
+                    }
+                    targets.insert(i, raw as f64);
+                }
+                mon.project_drawer_animate_to(&targets);
+            }
         }
     }
 
-    /// Clear all project overview fan animation state on every monitor.
+    /// Clear all drawer animation state on every monitor.
     fn project_overview_reset_anims(&mut self) {
         let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
             return;
@@ -5453,52 +5483,68 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    /// Rotate the fan front of `slot` by `dir` steps, animating the shuffle.
-    fn project_overview_cycle_depth(&mut self, slot: usize, dir: isize) {
-        let len = self.projects_at_slot(slot).len();
-        if len < 2 {
-            return;
+    /// Build the card list for the drawer, one entry per project in config order.
+    fn project_overview_entries(&self) -> Vec<ProjectOverviewEntry<'_, W>> {
+        if !self.project_overview_open {
+            return Vec::new();
         }
-        let Some(front) = self.project_overview_depth.get_mut(slot) else {
-            return;
-        };
-        *front = (*front as isize + dir).rem_euclid(len as isize) as usize;
 
-        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
-            return;
-        };
-        for mon in monitors {
-            mon.project_overview_animate_depth_shift(slot, dir);
+        let len = self.projects.len();
+        let selected = self.project_overview_selected;
+        let mut entries = Vec::with_capacity(len);
+
+        for (idx, project) in self.projects.iter().enumerate() {
+            // Continuous animated depth handled by the monitor; here we pass the
+            // static target so the monitor can fold its animations onto it.
+            let mut raw = idx as isize - selected as isize;
+            if raw > len as isize / 2 {
+                raw -= len as isize;
+            } else if raw < -(len as isize) / 2 {
+                raw += len as isize;
+            }
+            let depth = raw as f64;
+
+            let is_active = self.active_project_name.as_deref() == Some(project.name());
+            let color_rgb = match project.config.overview_border {
+                Some(border) => {
+                    let [r, g, b, _] = border.color.to_array_unpremul();
+                    [r, g, b]
+                }
+                None => project.color(),
+            };
+
+            let (item, state_label) = match &project.kind {
+                project::ProjectKind::Warm { workspaces, active_workspace_idx, .. } => {
+                    let ws = workspaces
+                        .get(*active_workspace_idx)
+                        .or_else(|| workspaces.first());
+                    match ws {
+                        Some(ws) => (ProjectOverviewItem::Warm(ws), "warm"),
+                        None => (ProjectOverviewItem::Placeholder, "warm"),
+                    }
+                }
+                project::ProjectKind::Dormant => (ProjectOverviewItem::Placeholder, "dormant"),
+            };
+            let state_label = if is_active { "active" } else { state_label };
+
+            entries.push(ProjectOverviewEntry {
+                idx,
+                name: project.name().to_string(),
+                depth,
+                color: [color_rgb[0], color_rgb[1], color_rgb[2], 1.],
+                is_active,
+                state_label,
+                item,
+            });
         }
+
+        entries
     }
 
-    pub fn project_overview_focus_slot_prev(&mut self) {
-        if self.project_overview_focused_slot > 0 {
-            self.project_overview_focused_slot -= 1;
-            self.project_overview_sync_focus_anim();
-        }
-    }
-
-    pub fn project_overview_focus_slot_next(&mut self) {
-        let max_slot = self.project_overview_depth.len().saturating_sub(1);
-        if self.project_overview_focused_slot < max_slot {
-            self.project_overview_focused_slot += 1;
-            self.project_overview_sync_focus_anim();
-        }
-    }
-
-    pub fn project_overview_focus_depth_closer(&mut self) {
-        self.project_overview_cycle_depth(self.project_overview_focused_slot, 1);
-    }
-
-    pub fn project_overview_focus_depth_further(&mut self) {
-        self.project_overview_cycle_depth(self.project_overview_focused_slot, -1);
-    }
-
-    /// Render the stacked project overview cards for one output.
+    /// Render the project overview drawer for one output.
     ///
-    /// The active project's workspaces are rendered by the regular overview
-    /// path; this renders every other project's cards fanned out per slot.
+    /// Fully independent of the regular overview: gated on
+    /// `project_overview_open` only, so the regular overview never shows it.
     pub fn render_project_overview_for_output<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -5506,7 +5552,7 @@ impl<W: LayoutElement> Layout<W> {
         focus_ring: bool,
         push: &mut dyn FnMut(MonitorRenderElement<R>),
     ) {
-        if !self.overview_open {
+        if !self.project_overview_open {
             return;
         }
 
@@ -5517,77 +5563,44 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
 
-        let mut entries = Vec::new();
-
-        for (pidx, project) in self.projects.iter().enumerate() {
-            if self.active_project_name.as_deref() == Some(project.name()) {
-                continue;
-            }
-
-            match &project.kind {
-                project::ProjectKind::Warm { workspaces, .. } => {
-                    for (slot, ws) in workspaces.iter().enumerate() {
-                        entries.push(ProjectOverviewEntry {
-                            slot,
-                            depth: self.project_fan_position(pidx, slot),
-                            item: ProjectOverviewItem::Warm(ws),
-                        });
-                    }
-                }
-                project::ProjectKind::Dormant => {
-                    for slot in 0..project.config.workspaces.len() {
-                        entries.push(ProjectOverviewEntry {
-                            slot,
-                            depth: self.project_fan_position(pidx, slot),
-                            item: ProjectOverviewItem::Placeholder,
-                        });
-                    }
-                }
-            }
-        }
-
+        let entries = self.project_overview_entries();
         mon.render_project_overview(ctx.r(), focus_ring, &entries, push);
     }
 
-    /// Cycle the project depth stack at the slot under the given point.
-    ///
-    /// Also moves the focused slot there, so subsequent keyboard/IPC cycling
-    /// continues from the same stack. Purely visual: never mutates projects.
-    pub fn project_overview_depth_cycle_at_point(
+    /// Handle a click in the drawer: clicking the front card commits, clicking
+    /// a back card selects it. Returns whether the click was consumed.
+    pub fn project_overview_click_at(
         &mut self,
         output: &Output,
         pos_within_output: Point<f64, Logical>,
-        closer: bool,
-    ) {
-        if !self.overview_open {
-            return;
+    ) -> bool {
+        if !self.project_overview_open {
+            return false;
         }
 
-        let max_slot = (0..self.projects.len())
-            .map(|pidx| self.project_slot_count(pidx))
-            .max()
-            .unwrap_or(0);
-
-        let slot = {
+        let hit = {
             let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
-                return;
+                return false;
             };
             let Some(mon) = monitors.iter_mut().find(|mon| mon.output == *output) else {
-                return;
+                return false;
             };
-            mon.slot_index_at(pos_within_output, max_slot)
+            mon.project_drawer_hit_test(pos_within_output, self.projects.len())
         };
 
-        let Some(slot) = slot else {
-            return;
+        let Some(stack_pos) = hit else {
+            return false;
         };
 
-        if slot >= self.project_overview_depth.len() {
-            self.init_project_overview_depth();
+        if stack_pos == 0 {
+            self.project_overview_commit();
+        } else {
+            let len = self.projects.len();
+            self.project_overview_selected =
+                (self.project_overview_selected + stack_pos) % len;
+            self.project_overview_sync_selection_anim(false);
         }
-        self.project_overview_focused_slot = slot;
-        self.project_overview_sync_focus_anim();
-        self.project_overview_cycle_depth(slot, if closer { 1 } else { -1 });
+        true
     }
 
     /// Search warm project workspaces for a window by wl_surface.

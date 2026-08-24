@@ -979,16 +979,14 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         project: String,
     },
-    /// Toggle (open/close) the project overview with staggered-depth rendering.
+    /// Toggle (open/close) the project overview drawer.
     ToggleProjectOverview {},
-    /// Move focus to the previous project slot in the project overview.
-    ProjectOverviewFocusSlotPrev {},
-    /// Move focus to the next project slot in the project overview.
-    ProjectOverviewFocusSlotNext {},
-    /// Move focus one depth layer closer in the project overview.
-    ProjectOverviewFocusDepthCloser {},
-    /// Move focus one depth layer further away in the project overview.
-    ProjectOverviewFocusDepthFurther {},
+    /// Select the previous project card in the project overview drawer.
+    ProjectOverviewPrev {},
+    /// Select the next project card in the project overview drawer.
+    ProjectOverviewNext {},
+    /// Switch to the selected project and close the drawer.
+    ProjectOverviewCommit {},
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.

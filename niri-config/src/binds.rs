@@ -372,10 +372,9 @@ pub enum Action {
     CloseProjectForce(String),
     KeepProjectOpen(#[knuffel(argument)] String),
     ToggleProjectOverview,
-    ProjectOverviewFocusSlotPrev,
-    ProjectOverviewFocusSlotNext,
-    ProjectOverviewFocusDepthCloser,
-    ProjectOverviewFocusDepthFurther,
+    ProjectOverviewPrev,
+    ProjectOverviewNext,
+    ProjectOverviewCommit,
     #[knuffel(skip)]
     ToggleWindowUrgent(u64),
     #[knuffel(skip)]
@@ -717,14 +716,9 @@ impl From<niri_ipc::Action> for Action {
             | niri_ipc::Action::CloseProjectForce { project } => Self::CloseProject(project),
             niri_ipc::Action::KeepProjectOpen { project } => Self::KeepProjectOpen(project),
             niri_ipc::Action::ToggleProjectOverview {} => Self::ToggleProjectOverview,
-            niri_ipc::Action::ProjectOverviewFocusSlotPrev {} => Self::ProjectOverviewFocusSlotPrev,
-            niri_ipc::Action::ProjectOverviewFocusSlotNext {} => Self::ProjectOverviewFocusSlotNext,
-            niri_ipc::Action::ProjectOverviewFocusDepthCloser {} => {
-                Self::ProjectOverviewFocusDepthCloser
-            }
-            niri_ipc::Action::ProjectOverviewFocusDepthFurther {} => {
-                Self::ProjectOverviewFocusDepthFurther
-            }
+            niri_ipc::Action::ProjectOverviewPrev {} => Self::ProjectOverviewPrev,
+            niri_ipc::Action::ProjectOverviewNext {} => Self::ProjectOverviewNext,
+            niri_ipc::Action::ProjectOverviewCommit {} => Self::ProjectOverviewCommit,
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),

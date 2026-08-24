@@ -1,6 +1,6 @@
 use knuffel::errors::DecodeError;
 
-use crate::SpawnAtStartup;
+use crate::{Color, SpawnAtStartup};
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct ProjectWorkspaceConfig {
@@ -10,12 +10,20 @@ pub struct ProjectWorkspaceConfig {
     pub spawn_at_startup: Vec<SpawnAtStartup>,
 }
 
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct ProjectOverviewBorder {
+    #[knuffel(child)]
+    pub color: Color,
+}
+
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct ProjectConfig {
     #[knuffel(argument)]
     pub name: String,
     #[knuffel(child)]
     pub keep_open: bool,
+    #[knuffel(child)]
+    pub overview_border: Option<ProjectOverviewBorder>,
     #[knuffel(children)]
     pub workspaces: Vec<ProjectWorkspaceConfig>,
 }
@@ -97,6 +105,37 @@ mod tests {
         "#;
         let config = parse_project(text);
         assert!(config.keep_open);
+    }
+
+    #[test]
+    fn parse_overview_border() {
+        let text = r##"
+            project "neovim" {
+                overview-border {
+                    color "#5aa9ff"
+                }
+                workspace "editor" {
+                }
+            }
+        "##;
+        let config = parse_project(text);
+        let border = config.overview_border.expect("border should parse");
+        assert_eq!(
+            border.color.to_array_unpremul(),
+            [90. / 255., 169. / 255., 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn no_overview_border() {
+        let text = r#"
+            project "plain" {
+                workspace "ws" {
+                }
+            }
+        "#;
+        let config = parse_project(text);
+        assert!(config.overview_border.is_none());
     }
 
     #[test]

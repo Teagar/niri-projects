@@ -13,6 +13,7 @@ fn make_project_config(name: &str) -> niri_config::ProjectConfig {
     niri_config::ProjectConfig {
         name: name.to_string(),
         keep_open: false,
+        overview_border: None,
         workspaces: vec![],
     }
 }
@@ -21,6 +22,7 @@ fn make_project_config_with_ws(name: &str, ws_name: &str) -> niri_config::Projec
     niri_config::ProjectConfig {
         name: name.to_string(),
         keep_open: false,
+        overview_border: None,
         workspaces: vec![niri_config::ProjectWorkspaceConfig {
             name: ws_name.to_string(),
             spawn_at_startup: vec![],
@@ -280,26 +282,29 @@ fn switch_to_warm_or_active_project_is_o1() {
 fn depth_navigation_does_not_mutate_state() {
     let mut layout = setup_layout_with_projects();
 
-    // Open the project overview.
+    // Open the project overview drawer.
     layout.toggle_project_overview();
+    assert!(layout.is_project_overview_open());
 
-    // Navigate depth — these should be no-ops (stubs).
-    layout.project_overview_focus_depth_closer();
-    layout.project_overview_focus_depth_further();
+    // Navigate selection — wraps around without panic.
+    let initial_selected = layout.project_overview_selected;
+    layout.project_overview_prev();
+    layout.project_overview_next();
 
-    // Navigate slots — also no-ops.
-    layout.project_overview_focus_slot_prev();
-    layout.project_overview_focus_slot_next();
-
-    // Overview should still be open.
-    assert!(
-        layout.is_overview_open(),
-        "overview must remain open after navigation"
+    // Selection should return to initial after round-trip.
+    assert_eq!(
+        layout.project_overview_selected, initial_selected,
+        "selection round-trip must return to initial"
     );
 
-    // Close it.
-    layout.toggle_overview();
-    assert!(!layout.is_overview_open());
+    // Close via commit (with no active project change).
+    let initial_active = layout.active_project_name.clone();
+    layout.project_overview_commit();
+    assert!(
+        !layout.is_project_overview_open(),
+        "drawer must close after commit"
+    );
+    assert_eq!(layout.active_project_name, initial_active);
 }
 
 #[test]
@@ -334,93 +339,124 @@ fn closing_project_destroys_workspaces() {
 }
 
 #[test]
-fn overview_slot_stack_includes_all_projects() {
+fn overview_drawer_entries_include_all_projects() {
     let mut layout = setup_layout_with_projects();
 
-    // Give both projects two configured workspaces each.
-    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
-    layout.projects[0]
-        .config
-        .workspaces
-        .push(niri_config::ProjectWorkspaceConfig {
-            name: "a1".to_string(),
-            spawn_at_startup: vec![],
-        });
-    layout.ensure_project(&make_project_config_with_ws("project_b", "b0"));
-    layout.projects[1]
-        .config
-        .workspaces
-        .push(niri_config::ProjectWorkspaceConfig {
-            name: "b1".to_string(),
-            spawn_at_startup: vec![],
-        });
+    // Closed drawer has no entries.
+    assert!(layout.project_overview_entries().is_empty());
 
-    // No active project yet: both projects occupy slots 0 and 1.
-    assert_eq!(layout.projects_at_slot(0), vec![0, 1]);
-    assert_eq!(layout.projects_at_slot(1), vec![0, 1]);
+    layout.toggle_project_overview();
 
-    // Activate project_a: it still counts at every slot via its attached workspaces.
+    // One card per project, in config order.
+    let entries = layout.project_overview_entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].idx, 0);
+    assert_eq!(entries[0].name, "project_a");
+    assert_eq!(entries[1].idx, 1);
+    assert_eq!(entries[1].name, "project_b");
+
+    // Nothing activated yet: both cards report dormant.
+    assert_eq!(entries[0].state_label, "dormant");
+    assert_eq!(entries[1].state_label, "dormant");
+
+    // Activating a project marks its card as active.
+    layout.switch_to_project("project_b");
+    let entries = layout.project_overview_entries();
+    assert_eq!(entries[0].state_label, "dormant");
+    assert_eq!(entries[1].state_label, "active");
+
+    // Closing the drawer clears the entries again.
+    layout.toggle_project_overview();
+    assert!(layout.project_overview_entries().is_empty());
+}
+
+/// Rule 3 regression test: the regular overview must NEVER show project cards.
+#[test]
+fn regular_overview_never_shows_project_cards() {
+    let mut layout = setup_layout_with_projects();
+
+    // One active project, one warm.
     layout.switch_to_project("project_a");
-    assert_eq!(layout.projects_at_slot(0), vec![0, 1]);
-    assert_eq!(layout.project_slot_count(0), 2);
+    layout.ensure_project(&make_project_config_with_ws("project_b", "b0"));
+
+    // Open the regular overview.
+    layout.toggle_overview();
+    assert!(layout.is_overview_open());
+    assert!(
+        !layout.is_project_overview_open(),
+        "regular overview must not open the project drawer"
+    );
+
+    // project_overview_entries() must be empty: projects don't leak in.
+    let entries = layout.project_overview_entries();
+    assert_eq!(
+        entries.len(),
+        0,
+        "regular overview must never trigger project card rendering"
+    );
+
+    layout.toggle_overview();
 }
 
 #[test]
-fn overview_fan_position_rotates_with_depth() {
+fn overview_selection_navigation_rotates_selection() {
     let mut layout = setup_layout_with_projects();
 
-    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
-    layout.ensure_project(&make_project_config_with_ws("project_b", "b0"));
+    // Stack is [project_a(0), project_b(1)]; selection starts on project_a.
+    assert_eq!(layout.project_overview_selected, 0);
 
-    // Stack is [project_a(0), project_b(1)]; front defaults to project_a.
-    assert_eq!(layout.project_fan_position(0, 0), 0);
-    assert_eq!(layout.project_fan_position(1, 0), 1);
-
-    // Cycle depth forward: project_b comes to the front.
     layout.toggle_project_overview();
-    layout.project_overview_focus_depth_closer();
-    assert_eq!(layout.project_fan_position(0, 0), 1);
-    assert_eq!(layout.project_fan_position(1, 0), 0);
+    assert_eq!(layout.project_overview_selected, 0);
 
-    // Cycle back: project_a is front again.
-    layout.project_overview_focus_depth_further();
-    assert_eq!(layout.project_fan_position(0, 0), 0);
-    assert_eq!(layout.project_fan_position(1, 0), 1);
+    // Next moves forward: project_b becomes selected.
+    layout.project_overview_next();
+    assert_eq!(layout.project_overview_selected, 1);
 
-    // Browsing depth never mutated any project's runtime state.
+    // Next again wraps back around to project_a.
+    layout.project_overview_next();
+    assert_eq!(layout.project_overview_selected, 0);
+
+    // Prev wraps backwards to project_b.
+    layout.project_overview_prev();
+    assert_eq!(layout.project_overview_selected, 1);
+
+    // Browsing the selection never mutated any project's runtime state.
     assert!(layout.projects[0].is_dormant() || layout.projects[0].is_warm());
 }
 
 #[test]
-fn overview_fan_order_follows_config_order() {
+fn overview_entry_order_follows_config_order() {
     let mut layout = setup_layout_with_projects();
 
-    // Three projects: stack at slot 0 is [a(0), b(1), c(2)].
-    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
-    layout.ensure_project(&make_project_config_with_ws("project_b", "b0"));
+    // Three projects: cards must be listed in config order [a, b, c].
     layout.ensure_project(&make_project_config_with_ws("project_c", "c0"));
 
-    // Reading the fan back-to-front (base card first) must follow config
-    // order: b shallower than c. So c is deeper (further back) than b.
-    assert_eq!(layout.project_fan_position(0, 0), 0);
-    assert_eq!(layout.project_fan_position(1, 0), 2);
-    assert_eq!(layout.project_fan_position(2, 0), 1);
+    layout.toggle_project_overview();
+    let entries = layout.project_overview_entries();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["project_a", "project_b", "project_c"]);
+
+    // The selected card always sits at depth 0 (front of the stack).
+    assert_eq!(entries[layout.project_overview_selected].depth, 0.);
 }
 
 #[test]
-fn overview_slot_navigation_clamps() {
+fn overview_navigation_wraps_around() {
     let mut layout = setup_layout_with_projects();
 
-    layout.ensure_project(&make_project_config_with_ws("project_a", "a0"));
+    // Three projects so wrap-around is observable beyond a simple swap.
+    layout.ensure_project(&make_project_config("project_c"));
 
     layout.toggle_project_overview();
-    // Only one slot exists; next must stay clamped.
-    layout.project_overview_focus_slot_next();
-    assert_eq!(layout.project_overview_focused_slot, 0);
+    assert_eq!(layout.project_overview_selected, 0);
 
-    // Prev from 0 also stays clamped.
-    layout.project_overview_focus_slot_prev();
-    assert_eq!(layout.project_overview_focused_slot, 0);
+    // Prev from the first project wraps to the last (no clamping).
+    layout.project_overview_prev();
+    assert_eq!(layout.project_overview_selected, 2);
+
+    // Next wraps back around to the first.
+    layout.project_overview_next();
+    assert_eq!(layout.project_overview_selected, 0);
 }
 
 #[test]

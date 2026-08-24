@@ -4161,7 +4161,8 @@ impl Niri {
                     let bg_color = ws.render_background().color();
                     state.xray.workspaces.push((geo, bg_color));
                 }
-                state.xray.suppress_shadows = self.layout.is_overview_open();
+                state.xray.suppress_shadows =
+                    self.layout.is_overview_open() || self.layout.is_project_overview_open();
                 state.xray.backdrop_color = state.backdrop_buffer.color();
                 let blur_options = BlurOptions::from(self.config.borrow().blur);
                 for buf in &state.xray.background {
@@ -4436,7 +4437,9 @@ impl Niri {
 
             // We don't expect more than one workspace when render_above_top_layer().
             if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
-                if !self.layout.is_overview_open() {
+                if !self.layout.is_overview_open()
+                    && !self.layout.is_project_overview_open()
+                {
                     push(ws.render_background().into());
                 }
             }
@@ -4491,13 +4494,15 @@ impl Niri {
                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
-                if !self.layout.is_overview_open() {
+                if !self.layout.is_overview_open()
+                    && !self.layout.is_project_overview_open()
+                {
                     process!(geo)(ws.render_background());
                 }
             }
         }
 
-        if !self.layout.is_overview_open() {
+        if !self.layout.is_overview_open() && !self.layout.is_project_overview_open() {
             mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
         }
 
